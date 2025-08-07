@@ -14,7 +14,10 @@ This comprehensive guide covers all aspects of configuring and customizing Byobu
 8. [Keybindings](#keybindings)
 9. [Session Management](#session-management)
 10. [Environment Variables](#environment-variables)
-11. [Advanced Configuration](#advanced-configuration)
+11. [Comprehensive byoburc Configuration](#comprehensive-byoburc-configuration)
+12. [Advanced Configuration](#advanced-configuration)
+13. [Performance Optimization](#performance-optimization)
+14. [Troubleshooting Configuration](#troubleshooting-configuration)
 
 ## Configuration Overview
 
@@ -56,8 +59,14 @@ All user configuration is stored in `~/.byobu/`:
 ### Core Configuration Files
 
 #### ~/.byoburc
-Main configuration file for environment variables:
+Main configuration file for environment variables and global settings. This file is sourced early in the byobu startup process and by most byobu utilities.
 
+**Loading Order:**
+1. Sourced by `byobu.in` during startup
+2. Loaded before backend selection and profile initialization
+3. Available to all byobu scripts and status modules
+
+**Basic Configuration:**
 ```bash
 # Backend selection
 export BYOBU_BACKEND=tmux
@@ -72,6 +81,8 @@ export BYOBU_PYTHON='/usr/bin/env python3'
 export BYOBU_CHARMAP=UTF-8
 export BYOBU_TERM=screen-256color
 ```
+
+**For comprehensive byoburc documentation with all environment variables and advanced examples, see [Comprehensive byoburc Configuration](#comprehensive-byoburc-configuration).**
 
 #### ~/.byobu/backend
 Simple backend selection:
@@ -506,6 +517,254 @@ export BYOBU_ALT_TITLE='${USER}@${HOSTNAME} - Custom Title'
 # Disable specific features
 export BYOBU_DISABLE_AUTOLAUNCH="1"
 export BYOBU_QUIET="1"
+```
+
+## Comprehensive byoburc Configuration
+
+The `~/.byoburc` file is the primary configuration file for byobu environment variables and global settings. It's sourced early in the startup process and provides the foundation for all byobu functionality.
+
+### Core Environment Variables
+
+#### Backend and Installation Settings
+```bash
+# Backend selection (tmux or screen)
+export BYOBU_BACKEND=tmux
+
+# Installation prefix (usually auto-detected)
+export BYOBU_PREFIX="/usr/local"
+
+# Python interpreter for configuration tools
+export BYOBU_PYTHON="/usr/bin/env python3"
+```
+
+#### Terminal and Display Settings
+```bash
+# Terminal type for proper color and feature support
+export BYOBU_TERM="screen-256color"
+
+# Character encoding
+export BYOBU_CHARMAP="UTF-8"
+
+# Default window name
+export BYOBU_WINDOW_NAME="shell"
+
+# Date and time formats
+export BYOBU_DATE="%Y-%m-%d"
+export BYOBU_TIME="%H:%M:%S"
+```
+
+#### Directory Configuration
+```bash
+# Configuration directory (usually ~/.byobu)
+export BYOBU_CONFIG_DIR="$HOME/.byobu"
+
+# Runtime cache directory (usually /dev/shm/byobu-$USER-*)
+export BYOBU_RUN_DIR="/tmp/byobu-$USER"
+```
+
+#### Status Bar Configuration
+```bash
+# Left side status modules
+export BYOBU_STATUS_LEFT="logo distro release"
+
+# Right side status modules
+export BYOBU_STATUS_RIGHT="network disk memory load_average time date"
+
+# Status refresh interval in seconds
+export BYOBU_STATUS_REFRESH="5"
+```
+
+#### Feature Control Variables
+```bash
+# Enable debug output
+export BYOBU_DEBUG=1
+
+# Suppress informational messages
+export BYOBU_QUIET=1
+
+# Disable automatic launching
+export BYOBU_DISABLE_AUTOLAUNCH=1
+
+# Disable window title updates
+export BYOBU_NO_TITLE=1
+
+# Custom window title format
+export BYOBU_ALT_TITLE='${USER}@${HOSTNAME} - Custom'
+```
+
+#### Cross-Platform Compatibility
+```bash
+# macOS-specific settings
+export BYOBU_SED="gsed"
+export BYOBU_READLINK="greadlink"
+
+# Pager and editor preferences
+export BYOBU_PAGER="less"
+export BYOBU_EDITOR="vim"
+
+# Resource limits support
+export BYOBU_ULIMIT="ulimit"
+```
+
+### Complete Example Configuration
+
+```bash
+#!/bin/bash
+# ~/.byoburc - Comprehensive byobu configuration
+
+# Core backend and installation
+export BYOBU_BACKEND=tmux
+export BYOBU_PREFIX="/usr/local"
+export BYOBU_PYTHON="/usr/bin/env python3"
+
+# Terminal settings
+export BYOBU_TERM="tmux-256color"
+export BYOBU_CHARMAP="UTF-8"
+
+# Custom date/time formats
+export BYOBU_DATE="%a %Y-%m-%d"
+export BYOBU_TIME="%H:%M:%S %Z"
+
+# Status bar configuration
+export BYOBU_STATUS_LEFT="logo distro release arch"
+export BYOBU_STATUS_RIGHT="network battery memory load_average time date"
+export BYOBU_STATUS_REFRESH=3
+
+# Performance optimization
+export BYOBU_QUIET=1
+export BYOBU_NO_TITLE=1
+
+# Conditional configuration based on environment
+if [ -n "$SSH_CONNECTION" ]; then
+    # SSH session - minimal status bar
+    export BYOBU_STATUS_RIGHT="load_average time"
+fi
+
+# Host-specific configuration
+case "$(hostname)" in
+    "server"*)
+        export BYOBU_STATUS_RIGHT="network load_average memory time"
+        export BYOBU_STATUS_REFRESH=10
+        ;;
+    "laptop"*)
+        export BYOBU_STATUS_RIGHT="battery wifi_quality memory time"
+        export BYOBU_STATUS_REFRESH=5
+        ;;
+    "desktop"*)
+        export BYOBU_STATUS_RIGHT="cpu_temp fan_speed memory load_average time"
+        ;;
+esac
+
+# Development environment detection
+if [ -d "$HOME/dev" ] || [ -n "$DEVELOPMENT" ]; then
+    export BYOBU_WINDOW_NAME="dev"
+    export BYOBU_STATUS_LEFT="logo custom"
+fi
+
+# Auto-launch configuration
+if [ -z "$BYOBU_LAUNCHED" ] && [ -n "$SSH_CONNECTION" ]; then
+    export BYOBU_LAUNCHED=1
+    exec byobu
+fi
+```
+
+### Environment Variable Reference
+
+| Variable | Purpose | Default | Example |
+|----------|---------|---------|---------|
+| `BYOBU_BACKEND` | Backend selection | `tmux` | `screen`, `tmux` |
+| `BYOBU_PREFIX` | Installation path | `/usr` | `/usr/local`, `$HOME/byobu` |
+| `BYOBU_PYTHON` | Python interpreter | Auto-detected | `/usr/bin/python3` |
+| `BYOBU_TERM` | Terminal type | `screen-256color` | `tmux-256color` |
+| `BYOBU_CHARMAP` | Character encoding | Auto-detected | `UTF-8` |
+| `BYOBU_CONFIG_DIR` | Config directory | `~/.byobu` | `~/.config/byobu` |
+| `BYOBU_RUN_DIR` | Runtime cache | `/dev/shm/byobu-$USER-*` | `/tmp/byobu-$USER` |
+| `BYOBU_STATUS_LEFT` | Left status modules | `logo distro release` | Custom module list |
+| `BYOBU_STATUS_RIGHT` | Right status modules | Default set | Custom module list |
+| `BYOBU_STATUS_REFRESH` | Refresh interval | `5` | `1-300` seconds |
+| `BYOBU_WINDOW_NAME` | Default window name | `-` | `shell`, `dev` |
+| `BYOBU_DATE` | Date format | `%Y-%m-%d` | `%a %b %d` |
+| `BYOBU_TIME` | Time format | `%H:%M:%S` | `%I:%M %p` |
+| `BYOBU_DEBUG` | Debug mode | Unset | `1` |
+| `BYOBU_QUIET` | Suppress messages | Unset | `1` |
+| `BYOBU_NO_TITLE` | Disable title updates | Unset | `1` |
+| `BYOBU_DISABLE_AUTOLAUNCH` | Disable auto-launch | Unset | `1` |
+
+### Loading Process and Precedence
+
+1. **System defaults** from `/etc/byobu/`
+2. **User byoburc** from `~/.byoburc` (highest priority for environment variables)
+3. **Backend selection** from `~/.byobu/backend`
+4. **Status configuration** from `~/.byobu/statusrc`
+5. **Profile settings** from selected profile
+6. **Runtime overrides** from command line or environment
+
+### Best Practices
+
+#### Organization
+```bash
+# Group related settings together
+# Core settings
+export BYOBU_BACKEND=tmux
+export BYOBU_PREFIX="/usr/local"
+
+# Display settings
+export BYOBU_TERM="tmux-256color"
+export BYOBU_CHARMAP="UTF-8"
+
+# Status bar
+export BYOBU_STATUS_LEFT="logo distro"
+export BYOBU_STATUS_RIGHT="memory time"
+```
+
+#### Comments and Documentation
+```bash
+# Use comments to explain complex logic
+if [ "$(uname)" = "Darwin" ]; then
+    # macOS requires different sed command
+    export BYOBU_SED="gsed"
+fi
+```
+
+#### Error Handling
+```bash
+# Check for required commands
+if command -v python3 >/dev/null 2>&1; then
+    export BYOBU_PYTHON="python3"
+elif command -v python >/dev/null 2>&1; then
+    export BYOBU_PYTHON="python"
+fi
+```
+
+### Troubleshooting byoburc
+
+#### Debug Configuration Loading
+```bash
+# Enable debug mode
+export BYOBU_DEBUG=1
+byobu
+
+# Check if byoburc is being loaded
+echo "Byoburc loaded" >> ~/.byoburc
+```
+
+#### Common Issues
+
+1. **Syntax errors**: Use `bash -n ~/.byoburc` to check syntax
+2. **Variable conflicts**: Check for conflicting environment variables
+3. **Path issues**: Verify `BYOBU_PREFIX` points to correct installation
+4. **Permission problems**: Ensure `~/.byoburc` is readable
+
+#### Backup and Recovery
+```bash
+# Backup current configuration
+cp ~/.byoburc ~/.byoburc.backup
+
+# Reset to defaults (byobu will recreate)
+mv ~/.byoburc ~/.byoburc.old
+
+# Restore from backup
+cp ~/.byoburc.backup ~/.byoburc
 ```
 
 ## Advanced Configuration
