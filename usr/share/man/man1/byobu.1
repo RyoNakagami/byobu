@@ -35,6 +35,8 @@ The background colors of the \fBbyobu\fP status lines can be adjusted by editing
 
 \fBcpu_freq\fP \- the current frequency of the cpu in GHz; displayed in the lower bar toward the right in white text on a light blue background
 
+\fBcpu_usage\fP \- the percentage of cpu time spent busy (not idle or waiting on I/O) since the previous update, across all cpus (Linux only); displayed in the lower bar toward the right in white text on a light blue background
+
 \fBcpu_temp\fP \- the cpu temperature in Celsius (default) or Fahrenheit, configure TEMP=F or TEMP=C in \fI$BYOBU_CONFIG_DIR/statusrc\fP; displayed in the lower bar toward the right in yellow text on a black background; you may override the detected cpu temperature device by setting MONITORED_TEMP=/proc/acpi/whatever in \fI$BYOBU_CONFIG_DIR/statusrc\fP
 
 \fBcustom\fP \- user defined custom scripts; must be executable programs of any kind in \fI$BYOBU_CONFIG_DIR/bin\fP; must be named N_NAME, where N is the frequency in seconds to refresh the status indicator, and NAME is the name of the script; N should not be less than 5 seconds; the script should echo a small amount of text to standard out, standard error is discarded; the indicator will be displayed in the lower panel, in default colors, unless you manually specify the colors in your script's output; BEWARE, cpu-intensive custom scripts may impact your overall system performance and could upset your system administrator!  In fact, you can easily copy and modify \fBany\fP status script usually found in \fI/usr/lib/byobu/*\fP to your local \fI$HOME/.byobu/\fP directory.
@@ -45,9 +47,9 @@ The background colors of the \fBbyobu\fP status lines can be adjusted by editing
 
 \fBdate\fP \- the system date in YYYY-MM-DD format, or you can set this to any valid \fBstrftime\fP(3) you like in \fI$BYOBU_CONFIG_DIR/datetime\fP; displayed in the lower on the far right in the default text color on the default background
 
-\fBdisk\fP \- total disk space available and total used on / directory; displayed in the lower bar on the far right in white text on a light purple background; override the default directory by specifying an alternate mount point with MONITORED_DISK=/wherever in \fI$BYOBU_CONFIG_DIR/statusrc\fP
+\fBdisk\fP \- total disk space available and total used on / directory; displayed in the lower bar on the far right in white text on a light purple background; override the default directory by specifying an alternate mount point with MONITORED_DISK=/wherever in \fI$BYOBU_CONFIG_DIR/statusrc\fP; to monitor several disks, list their mount points or devices separated by spaces, such as MONITORED_DISK="/ /home /dev/sdb1", and each one is shown labeled by the last component of its name, such as \fB/:94G45% home:1.8T12%\fP
 
-\fBdisk_io\fP \- instantaneous read/write througput in kB/s or MB/s over the last 3 seconds; displayed in the lower bar toward the right in white text on a light purple background with a leading '<' sign indicating 'read speed' and '>' sign indicating 'write speed'; override the default monitored disk by specifying an alternate device with MONITORED_DISK=/dev/sdb, and override the default DISK_IO_THRESHOLD=50 (kB/s) in \fI$BYOBU_CONFIG_DIR/statusrc\fP
+\fBdisk_io\fP \- instantaneous read/write througput in kB/s or MB/s over the last 3 seconds; displayed in the lower bar toward the right in white text on a light purple background with a leading '<' sign indicating 'read speed' and '>' sign indicating 'write speed'; override the default monitored disk by specifying an alternate device with MONITORED_DISK=/dev/sdb (if it lists several disks, only the first is monitored), and override the default DISK_IO_THRESHOLD=50 (kB/s) in \fI$BYOBU_CONFIG_DIR/statusrc\fP
 
 \fBdistro\fP \- OS/distribution name of the release running on the current system as reported by \fBlsb_release(1)\fP or \fI/etc/issue\fP; displayed in the lower bar in bold black text toward the left on a grey background; you may override the detected release with DISTRO=Whatever in \fI$BYOBU_CONFIG_DIR/statusrc\fP
 
@@ -65,7 +67,7 @@ The background colors of the \fBbyobu\fP status lines can be adjusted by editing
 
 \fBip_address6\fP \- the IPv6 address of the system; displayed in the upper bar on the far right in bold black text on a grey background;  you can show your external ip address by setting 'IP_EXTERNAL=1' in \fI$BYOBU_CONFIG_DIR/statusrc\fP
 
-\fBload_average\fP \- the system load average over the last 1 minute; displayed in the lower bar toward the right in black text on a yellow background
+\fBload_average\fP \- the system load average over the last 1 minute; displayed in the lower bar toward the right in black text on a yellow background; set LOAD_AVERAGES=3 in \fI$BYOBU_CONFIG_DIR/statusrc\fP to display all three intervals (1, 5, and 15 minutes) space-separated
 
 \fBlogo\fP \- an approximation of the current operating system's logo; displayed in the lower bar on the far left; you may customize this logo by setting a chosen logo with LOGO=:-D in \fI$BYOBU_CONFIG_DIR/statusrc\fP
 
@@ -109,11 +111,70 @@ The background colors of the \fBbyobu\fP status lines can be adjusted by editing
 
 \fBwifi_quality\fP \- the connection rate and signal quality of the wifi connection; displayed in the lower bar toward the right in black text on a cyan background; the connection rate is in 'Mb/s' and the signal quality is as a percentage with a trailing '%'; override the default interface by specifying an alternate interface with MONITORED_NETWORK=wlan0 in \fI$BYOBU_CONFIG_DIR/statusrc\fP
 
+.SH STATUS ICONS
+
+\fBbyobu\fP displays status indicators using different icons depending on your terminal encoding. When using \fBbyobu\-tmux\fP(1) with UTF-8 encoding, Unicode symbols are displayed. Otherwise, ASCII\-only icons are used (such as with \fBbyobu\-screen\fP(1) or non\-UTF\-8 terminals).
+
+.TP
+\fBUnicode Icons\fP (displayed when BYOBU_BACKEND=tmux and BYOBU_CHARMAP=UTF\-8):
+.TP
+.B updates_available:
+! = regular updates available; ⚠ = distribution upgrades available; ‼ = security updates available
+.TP
+.B reboot_required:
+⟳ = system reboot required; ⚠ = unattended upgrade in progress; 🗹 = kernel is live\-patched
+.TP
+.B disk_io:
+◂ = disk read activity; ▸ = disk write activity
+.TP
+.B network:
+▴ = network upload activity; ▾ = network download activity
+.TP
+.B mail:
+⍌ = new mail waiting
+.TP
+.B session:
+〣 = session indicator
+.TP
+.B trash:
+♸ = items in trash
+.TP
+\fBASCII Icons\fP (displayed with screen backend or non\-UTF\-8 terminals):
+.TP
+.B updates_available:
+! = regular updates; /!\\\\ = upgrades; !! = security updates
+.TP
+.B reboot_required:
+(R) = reboot required; /!\\\\ = upgrade running; [/] = live\-patched
+.TP
+.B disk_io:
+< = read; > = write
+.TP
+.B network:
+^ = upload; v = download
+.TP
+.B mail:
+[M] = new mail
+.TP
+.B session:
+| = session indicator
+.TP
+.B trash:
+T = trash
+.TP
+To see detailed explanations of all active status indicators, press \fBCtrl\-a $\fP while running byobu.
+
 .SH SESSIONS
 
 Byobu name screen sessions "byobu", if unspecified.  To hide sessions from \fBbyobu-select-session\fP(1), prepend a "." to the beginning of the session name, like:
 
  byobu \-S .hidden
+
+In \fBbyobu-tmux\fP(1), running \fBbyobu\fP to attach to an already-running session does not, by default, reattach to that exact session object. Instead it creates a new session in the same tmux \fIsession group\fP as the existing one, sharing the same set of windows and panes while giving each attaching terminal its own independent current-window focus and scrollback view. tmux names each member of the group by appending "\-2", "\-3", and so on to the original session's name, and the "session" status indicator (see STATUS NOTIFICATIONS above) counts every member of the group, not just one \-\- so opening and detaching from byobu repeatedly is expected to grow this count, and switching between group members with the window\-switching keybindings will not show different window content, since the windows are shared. Every session in the group other than the original has tmux's \fBdestroy-unattached\fP option set, so it is automatically destroyed as soon as you switch away from it, which is why the indicator eventually settles back down on its own.
+
+To make \fBbyobu\fP reattach to the exact same session instead of creating a new grouped one on every invocation, create an empty file at \fI$BYOBU_CONFIG_DIR/.reuse-session\fP:
+
+ touch $BYOBU_CONFIG_DIR/.reuse-session
 
 .SH WINDOWS
 
@@ -157,7 +218,7 @@ byobu uses decimal for measurements of network data transfer, meaning multiple o
 
 .SH KEYBINDINGS
 
-byobu keybindings can be user defined in /usr/share/byobu/keybindings/ (or within .screenrc if byobu-export was used). The common key bindings are:
+Add your own tmux keybindings to \fI$BYOBU_CONFIG_DIR/keybindings.tmux\fP and other tmux settings to \fI$BYOBU_CONFIG_DIR/.tmux.conf\fP (usually ~/.byobu or ~/.config/byobu); byobu loads both after its defaults and never overwrites them.  Don't edit \fIprofile.tmux\fP, which loads byobu's defaults.  The common key bindings are:
 
 \fBF2\fP \- Create a new window
 
@@ -201,7 +262,11 @@ byobu keybindings can be user defined in /usr/share/byobu/keybindings/ (or withi
 
 \fBCtrl-a R\fP \- Reload profile
 
-\fBCtrl-a !\fP \- Toggle key bindings on and off
+\fBCtrl-a !\fP \- Toggle key bindings on and off (screen backend)
+
+\fBShift-F12\fP \- Toggle byobu F-key bindings on and off (tmux backend)
+
+\fBF12\fP then any F-key \- Send that F-key to the running application, eg. Midnight Commander, instead of running byobu's binding (tmux backend)
 
 \fBCtrl-a k\fP \- Kill the current window
 
@@ -209,7 +274,9 @@ byobu keybindings can be user defined in /usr/share/byobu/keybindings/ (or withi
 
 .SH "SCROLLBACK, COPY, PASTE MODES"
 
-Each window in Byobu has up to 10,000 lines of scrollback history, which you can enter and navigate using the \fBalt-pgup\fP and \fBalt-pgdn\fP keys.  Exit this scrollback mode by hitting \fBenter\fP.  You can also easily copy and paste text from scrollback mode.  To do so, enter scrollback using \fBalt-pgup\fP or \fBalt-pgdn\fP, press the \fBspacebar\fP to start highlighting text, use \fBup/down/left/right/pgup/pgdn\fP to select the text, and press \fBenter\fP to copy the text.  You can then paste the text using \fBalt-insert\fP or \fBctrl-a-]\fP.
+Each window in Byobu has up to 100,000 lines of scrollback history in \fBbyobu-tmux\fP(1), or 10,000 lines in \fBbyobu-screen\fP(1), which you can enter and navigate using the \fBalt-pgup\fP and \fBalt-pgdn\fP keys.  Exit this scrollback mode by hitting \fBenter\fP.  You can also easily copy and paste text from scrollback mode.  To do so, enter scrollback using \fBalt-pgup\fP or \fBalt-pgdn\fP, press the \fBspacebar\fP to start highlighting text, use \fBup/down/left/right/pgup/pgdn\fP to select the text, and press \fBenter\fP to copy the text.  You can then paste the text into any Byobu window using \fBF12 ]\fP, or \fBalt-insert\fP in \fBbyobu-tmux\fP(1); \fBctrl-a ]\fP works too if you have set ctrl-a to Screen mode (see \fBbyobu-ctrl-a\fP(1)).  This pastes from Byobu's own buffer; to copy to your desktop's clipboard as well, your terminal must accept OSC 52 clipboard requests.
+
+In \fBbyobu-tmux\fP(1), scrollback mode shows a position indicator in the top right corner of the window, such as \fB14:10 [24/32]\fP.  Inside the brackets, the first number is how many lines you have scrolled up from the bottom (0 is the live view), and the second is the number of lines of history available, so the two are equal once you reach the top.  Since tmux 3.4, the indicator also shows the time at which the line at the top of the screen was printed (\fB14:10\fP).  While searching, it shows the number of matches.  Since tmux 3.6, its format can be changed with tmux's \fBcopy-mode-position-format\fP option; see \fBtmux\fP(1).
 
 .SH "BUGS"
 
@@ -222,10 +289,24 @@ PuTTY users should configure enable UTF-8 characters in order to fix status refr
 
 PuTTY users should avoid resizing their window to one character tall, as this can sometimes crash \fBbyobu-screen\fP.
 
-Apple Mac OSX terminal users have reported 'flashing text'.  You can fix this in the advanced settings of the terminal application, with 'Declare Terminal As: xterm-color'.
+Apple macOS users: by default the Option key types special characters instead of acting as Alt.  To use Byobu's Alt keybindings, enable 'Use Option as Meta key' in Terminal (Settings > Profiles > Keyboard), or set the Left Option key to 'Esc+' in iTerm2 (Settings > Profiles > Keys).  If Ctrl-F2 or Shift-F2 behave like plain F2, the terminal is not sending modified function keys.  Byobu's prefix bindings still work: \fBF12\fP then \fB%\fP for a vertical split, or \fBF12\fP then \fB"\fP for a horizontal split.  macOS also reserves some Ctrl-F-keys as system shortcuts (System Settings > Keyboard > Keyboard Shortcuts), and the F-keys may need \fBfn\fP unless 'Use F1, F2, etc. keys as standard function keys' is enabled.
 
-Apple Mac keyboard users may need to specify a vt100 terminal by adding this to your OSX profile, in order to get Byobu's function keys and colors to work:
-  alias ssh='TERM=vt100 ssh'
+URxvt users have reported that Ctrl+Shift+F-key combinations do not work by default, because URxvt does not send the expected escape sequences for those key chords.  You can fix this by adding the following to \fI~/.Xresources\fP (then running \fBxrdb -merge ~/.Xresources\fP):
+.nf
+  URxvt.keysym.S-C-F1:  string:\\033[11@
+  URxvt.keysym.S-C-F2:  string:\\033[12@
+  URxvt.keysym.S-C-F3:  string:\\033[13@
+  URxvt.keysym.S-C-F4:  string:\\033[14@
+  URxvt.keysym.S-C-F5:  string:\\033[15@
+  URxvt.keysym.S-C-F6:  string:\\033[17@
+  URxvt.keysym.S-C-F7:  string:\\033[18@
+  URxvt.keysym.S-C-F8:  string:\\033[19@
+  URxvt.keysym.S-C-F9:  string:\\033[20@
+  URxvt.keysym.S-C-F10: string:\\033[21@
+  URxvt.keysym.S-C-F11: string:\\033[23@
+  URxvt.keysym.S-C-F12: string:\\033[24@
+.fi
+See: \fIhttps://github.com/dustinkirkland/byobu/issues/108\fP
 
 Users of a non-UTF-8 locale (such as cs_CZ charset ISO-8859-2), may need to add "defutf8 off" to \fI~/.screenrc\fP, if some characters are rendering as "?".
 
@@ -240,7 +321,7 @@ Byobu requires a suitable \fBulimit\fP(3) values to run.  If you get an error at
 .TP
 \fBscreen\fP(1), \fBbyobu-config\fP(1), \fBbyobu-export\fP(1), \fBbyobu-status\fP(1), \fBbyobu-status-detail\fB(1), \fBbyobu-enable\fB(1), \fBbyobu-launch\fB(1), \fBbyobu-select-backend\fP(1), \fBtmux\fP(1)
 .TP
-\fIhttp://byobu.org\fP
+\fIhttps://byobu.org\fP
 .PD
 
 .SH AUTHOR

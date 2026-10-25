@@ -20,17 +20,32 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 __load_average_detail() {
-	cat /proc/loadavg
+	if [ -r /proc/loadavg ]; then
+		cat /proc/loadavg
+	elif [ "$BYOBU_OSTYPE" = "OpenBSD" ]; then
+		sysctl -n vm.loadavg 2>/dev/null
+	else
+		uptime
+	fi
 }
 
 __load_average() {
 	if [ -r "/proc/loadavg" ]; then
 		read one five fifteen other < /proc/loadavg
+	elif [ "$BYOBU_OSTYPE" = "OpenBSD" ]; then
+		# vm.loadavg returns "{ x.xx y.yy z.zz }" -- fields 2,3,4 are the averages
+		read -r one five fifteen <<EOF
+$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2, $3, $4}')
+EOF
 	else
 		one=$(uptime | sed -e "s/.*://" | awk '{print $1}')
 	fi
 	[ -n "$one" ] || return
-	color Y k; printf "$one"; color --
+	if [ "${LOAD_AVERAGES:-1}" = "3" ] && [ -n "$five" ] && [ -n "$fifteen" ]; then
+		color Y k; printf "%s %s %s" "$one" "$five" "$fifteen"; color --
+	else
+		color Y k; printf "%s" "$one"; color --
+	fi
 }
 
 # vi: syntax=sh ts=4 noexpandtab

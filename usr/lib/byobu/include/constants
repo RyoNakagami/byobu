@@ -54,21 +54,44 @@ eval $BYOBU_TEST sensible-editor >/dev/null 2>&1 && export BYOBU_EDITOR="sensibl
 eval $BYOBU_TEST "$BYOBU_EDITOR" >/dev/null 2>&1 || export BYOBU_EDITOR="vim"
 
 
+# Cache the OS name to avoid repeated uname forks in status scripts.
+# uname is POSIX-mandated and present on all supported platforms.
+[ -z "$BYOBU_OSTYPE" ] && export BYOBU_OSTYPE=$(uname -s 2>/dev/null)
+
 # Check sed's follow-symlinks feature
-$BYOBU_SED --follow-symlinks "s///" /dev/null 2>/dev/null && BYOBU_SED_INLINE="$BYOBU_SED -i --follow-symlinks" || BYOBU_SED_INLINE="$BYOBU_SED -i"
+if [ -z "$BYOBU_SED_INLINE" ]; then
+	$BYOBU_SED --follow-symlinks "s///" /dev/null 2>/dev/null && export BYOBU_SED_INLINE="$BYOBU_SED -i --follow-symlinks" || export BYOBU_SED_INLINE="$BYOBU_SED -i"
+fi
 
 # Determine if we have ulimit support
 eval $BYOBU_TEST ulimit >/dev/null 2>&1 && export BYOBU_ULIMIT="ulimit" || export BYOBU_ULIMIT="false"
 
-# Find a suitable python interpreter, if undefined
+# Allow overriding the gettext binary, same escape hatch as BYOBU_PYTHON
+# above: packagers whose runtime PATH doesn't resolve a bare "gettext" (e.g.
+# a relocatable/sandboxed store) can set this to an absolute path instead of
+# patching the source. Untouched, this preserves today's exact behavior.
+[ -z "$BYOBU_GETTEXT" ] && export BYOBU_GETTEXT="gettext"
+
+# Find a suitable python interpreter, if undefined.
+# Cache the result in $BYOBU_CONFIG_DIR so each status-bar subprocess
+# (run fresh by tmux every few seconds) does not re-import snack on NFS
+# or slow filesystems.  LP: #2076905
 if [ -z "$BYOBU_PYTHON" ]; then
-	if python3 -c "import snack" >/dev/null 2>&1; then
-		export BYOBU_PYTHON="python3"
-	elif python2 -c "import snack" >/dev/null 2>&1; then
-		export BYOBU_PYTHON="python2"
-	elif python -c "import snack" >/dev/null 2>&1; then
-		export BYOBU_PYTHON="python"
+	_byobu_python_cache="${BYOBU_CONFIG_DIR:-$HOME/.byobu}/.python_cache"
+	if [ -f "$_byobu_python_cache" ]; then
+		IFS= read -r BYOBU_PYTHON < "$_byobu_python_cache" 2>/dev/null || true
+		export BYOBU_PYTHON
+	else
+		if python3 -c "import snack" >/dev/null 2>&1; then
+			export BYOBU_PYTHON="python3"
+		elif python2 -c "import snack" >/dev/null 2>&1; then
+			export BYOBU_PYTHON="python2"
+		elif python -c "import snack" >/dev/null 2>&1; then
+			export BYOBU_PYTHON="python"
+		fi
+		printf "%s\n" "$BYOBU_PYTHON" > "$_byobu_python_cache" 2>/dev/null || true
 	fi
+	unset _byobu_python_cache
 fi
 
 export BYOBU_WINDOW_NAME="-"

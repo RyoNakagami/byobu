@@ -1,0 +1,6 @@
+.venv
+__pycache__
+mobile/build/
+mobile/dist/
+mobile/trustmux.egg-info/
+/debian/

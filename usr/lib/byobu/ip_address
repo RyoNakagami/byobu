@@ -1,6 +1,7 @@
-#!/bin/sh -e
+#!/bin/bash -e
 #
 #    ip_address: report a host's ip address
+#    Note: Uses decimal sleep (0.02, 0.1) which requires bash
 #
 #    Copyright (C) 2008-2011 Canonical Ltd.
 #    Copyright (C) 2011-2014 Dustin Kirkland
@@ -33,7 +34,13 @@ __ip_address() {
 		interface="$MONITORED_NETWORK"
 	else
 		case "$IPV6" in
-			1|true|yes) interface=$(awk '$10 != "lo" { iface=$10 ; }; END { print iface; }' /proc/net/ipv6_route);;
+			1|true|yes)
+				if [ -r /proc/net/ipv6_route ]; then
+					interface=$(awk '$10 != "lo" { iface=$10 ; }; END { print iface; }' /proc/net/ipv6_route)
+				else
+					get_network_interface; interface="$_RET"
+				fi
+			;;
 			*) get_network_interface; interface="$_RET";;
 		esac
 	fi
@@ -42,6 +49,7 @@ __ip_address() {
 			if [ "$IP_EXTERNAL" = "1" ]; then
 				# Background an update
 				timeout 1 wget -q -O- http://v6.ipv6-test.com/api/myip.php </dev/null >"$cache" 2>/dev/null &
+				# Brief sleep for cold-start display optimization (requires bash)
 				sleep 0.02
 			else
 				# Background an update
@@ -60,19 +68,42 @@ __ip_address() {
 		;;
 		*)
 			if [ "$IP_EXTERNAL" = "1" ]; then
-				timeout 1 wget -q -O- http://v4.ipv6-test.com/api/myip.php </dev/null >"$cache" 2>/dev/null &
-				sleep 0.02
+				if [ -n "$EXTERNAL_IP_SOURCE" ]; then
+					# User-specified URL (e.g. https://api.ipify.org). LP: #1869483
+					timeout 1 wget -q -O- "$EXTERNAL_IP_SOURCE" </dev/null >"$cache" 2>/dev/null &
+					sleep 0.02
+				elif command -v dig >/dev/null 2>&1; then
+					# Try dig with OpenDNS first (faster), fall back to wget
+					timeout 1 dig +short myip.opendns.com @resolver1.opendns.com </dev/null 2>/dev/null | tr -d '\n' >"$cache" &
+					# Brief sleep for cold-start display optimization (requires bash)
+					sleep 0.1
+				fi
+				# Fall back to wget if primary source didn't work
+				if [ ! -s "$cache" ]; then
+					timeout 1 wget -q -O- http://v4.ipv6-test.com/api/myip.php </dev/null >"$cache" 2>/dev/null &
+					# Brief sleep for cold-start display optimization (requires bash)
+					sleep 0.02
+				fi
 				[ -s "$cache" ] && read ipaddr < "$cache"
 			elif metadata_available; then
 				# We're in EC2, so get our public IP address
 				timeout 0.2 wget -q -O- http://169.254.169.254/latest/meta-data/public-ipv4 </dev/null >"$cache" 2>/dev/null &
+				# Brief sleep for cold-start display optimization (requires bash)
 				sleep 0.02
 				[ -s "$cache" ] && read ipaddr < "$cache"
 			else
 				if [ -x /sbin/ip ]; then
-					ipaddr=$(LC_ALL=C /sbin/ip -4 addr list dev "$interface" scope global 2>/dev/null)
-					ipaddr=${ipaddr#* inet }
-					ipaddr=${ipaddr%%/*}
+					# 'ip route get' reports the preferred source for outbound
+					# traffic without needing to guess the interface. LP: #2015819
+					# But an explicit MONITORED_NETWORK (eg. tun0) wins. LP: #1918295
+					[ -n "$MONITORED_NETWORK" ] || ipaddr=$(LC_ALL=C /sbin/ip route get 1.1.1.1 2>/dev/null | \
+						awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+					# Fall back to interface-based detection (no default route, VPN, etc.)
+					if [ -z "$ipaddr" ]; then
+						ipaddr=$(LC_ALL=C /sbin/ip -4 addr list dev "$interface" scope global 2>/dev/null)
+						ipaddr=${ipaddr#* inet }
+						ipaddr=${ipaddr%%/*}
+					fi
 				elif eval $BYOBU_TEST ifconfig >/dev/null 2>&1; then
 					ipaddr=$(ifconfig "$interface" | grep "inet " | awk '{print $2}')
 				fi

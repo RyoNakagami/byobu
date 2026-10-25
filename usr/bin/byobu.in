@@ -18,14 +18,14 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-VERSION=6.12
+VERSION=@VERSION@
 PKG="byobu"
 
 # All sorts of things go wrong if you don't own your $HOME dir.
 # This happens under sudo, if you don't use the -H option; Byobu will
 # create a bunch of files in your $HOME which will be owned by root.
-if [ ! -O "$HOME" ]; then
-	echo "Cannot run $PKG because [$USER] does not own [$HOME]" 1>&2
+if [ ! -O "$HOME" ] && [ ! -O "$HOME/.profile" ]; then
+	echo "Cannot run $PKG because [$USER] does not own [$HOME] or [$HOME/.profile]" 1>&2
 	if [ -n "$SUDO_USER" ]; then
 		echo "To run $PKG under sudo, you MUST use 'sudo -H'" 1>&2
 	fi
@@ -38,6 +38,23 @@ fi
 if [ "$SHELL" = "/bin/ash" ] || [ "$SHELL" = "ash" ] || [ -z "$SHELL" ]; then
 	[ -x "/bin/bash" ] && export SHELL="/bin/bash"
 fi
+
+# When launched as a non-login, non-interactive command (e.g. an SSH forced
+# command: `ssh host -t byobu`), our shell never sourced /etc/profile, so
+# $LANG can still be "C"/"POSIX"/unset even though the system has a real
+# default locale configured. The first time this process starts the backend
+# (tmux/screen), whatever environment we have right here becomes that
+# server's permanently captured baseline, inherited by every future window
+# and split -- not just the first one, which byobu-shell separately patches
+# up for itself by using a login shell. Fix it here too, so later windows
+# and splits (F2, Shift-F2, Ctrl-F2, ...) inherit a sane locale as well.
+# GH: #120
+case "$LANG" in
+	""|C|POSIX)
+		[ -r /etc/default/locale ] && . /etc/default/locale
+		export LANG LANGUAGE
+	;;
+esac
 
 # Source local byobu config
 if [ -r "$HOME/.byoburc" ]; then
@@ -53,7 +70,14 @@ if [ -z "${BYOBU_PREFIX}" ]; then
 		. "$HOME/.byoburc"
 	fi
 fi
-export BYOBU_CHARMAP=$(locale charmap)
+BYOBU_CHARMAP=$(locale charmap 2>/dev/null) || BYOBU_CHARMAP=
+if [ -z "$BYOBU_CHARMAP" ]; then
+	# OpenBSD's locale(1) has no 'charmap' keyword; use the locale's name. LP: #1697314
+	case "${LC_ALL:-${LC_CTYPE:-$LANG}}" in
+		*[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) BYOBU_CHARMAP="UTF-8" ;;
+	esac
+fi
+export BYOBU_CHARMAP
 [ -r "$HOME/.byoburc" ] && . "$HOME/.byoburc"
 [ -z "${BYOBU_PREFIX}" ] && export BYOBU_PREFIX="@prefix@" || export BYOBU_PREFIX
 . "${BYOBU_PREFIX}/lib/${PKG}/include/common"
@@ -63,6 +87,16 @@ export BYOBU_CHARMAP=$(locale charmap)
 case "$0" in
 	*byobu-screen) BYOBU_BACKEND="screen" ;;
 	*byobu-tmux) BYOBU_BACKEND="tmux" ;;
+esac
+
+# Explicit override for callers that can't rely on argv[0] matching a
+# "byobu-screen"/"byobu-tmux" filename -- e.g. a package wrapper that execs
+# the real binary under a different on-disk name than what the shell sees as
+# $0. Wins over both the config file and the argv[0] pattern-match above, so
+# it behaves like actually running byobu-screen/byobu-tmux. Unset by default,
+# so this is a no-op for everyone who doesn't set it.
+case "$BYOBU_FORCE_BACKEND" in
+	screen|tmux) BYOBU_BACKEND="$BYOBU_FORCE_BACKEND" ;;
 esac
 
 # At this point, we're sure BYOBU_BACKEND is properly defined
@@ -107,25 +141,60 @@ fi
 # Sanitize the environment
 byobu-janitor --force
 
-# Set the window title if this is a TTY
+# Set the window title if this is a TTY.  Everything in this block is
+# cosmetic (a status setting, an IP address to show in the title) and must
+# never be able to take the whole session down with it: we run under
+# "sh -e", and a user's statusrc erroring out, or a failure inside
+# ip_address's network detection, previously killed byobu outright with a
+# silent exit 1 -- no session, no explanation. -e is disabled for exactly
+# this block, restored right after, and either failure is now named on
+# stderr so there is something to act on instead of a bare exit code.
+# GH: #146
 if [ -t 1 ]; then
-	[ -r "$BYOBU_CONFIG_DIR/statusrc" ] && . "$BYOBU_CONFIG_DIR/statusrc"
+	set +e
+	if [ -r "$BYOBU_CONFIG_DIR/statusrc" ]; then
+		. "$BYOBU_CONFIG_DIR/statusrc"
+		_byobu_rc=$?
+		[ "$_byobu_rc" = 0 ] || echo "byobu: warning: error reading $BYOBU_CONFIG_DIR/statusrc (exit $_byobu_rc); some status settings may be missing" 1>&2
+	fi
 	. $BYOBU_PREFIX/lib/$PKG/ip_address
-	BYOBU_TITLE=${BYOBU_ALT_TITLE:-'${USER}@${HOSTNAME:-$(hostname)} ($(__ip_address t)) - ${PKG}'}
-	[ -n "$BYOBU_NO_TITLE" ] || eval printf \"\\033\]0\;${BYOBU_TITLE}\\007\"
+	if [ -n "$BYOBU_ALT_TITLE" ]; then
+		_byobu_title="$BYOBU_ALT_TITLE"
+	else
+		_byobu_ip="$(__ip_address t)"
+		_byobu_rc=$?
+		[ "$_byobu_rc" = 0 ] || { echo "byobu: warning: error determining IP address for the terminal title (exit $_byobu_rc); continuing without it" 1>&2; _byobu_ip=; }
+		_byobu_title="${USER}@$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null) ($_byobu_ip) - ${PKG}"
+	fi
+	[ -n "$BYOBU_NO_TITLE" ] || printf '\033]0;%s\007' "$_byobu_title"
+	unset _byobu_rc _byobu_ip
+	set -e
 fi
 
-# Drop a symlink to the ssh socket in $HOME, since we can ensure that exists
+# Drop a symlink to the ssh socket in $HOME, since we can ensure that exists.
+# Include hostname in the name so NFS-shared homes don't stomp each other.
 if [ -S "$SSH_AUTH_SOCK" ] && [ ! -h "$SSH_AUTH_SOCK" ]; then
-	ln -sf "$SSH_AUTH_SOCK" "$BYOBU_CONFIG_DIR/.ssh-agent"
-	export SSH_AUTH_SOCK="$BYOBU_CONFIG_DIR/.ssh-agent"
+	_byobu_agent="$BYOBU_CONFIG_DIR/.ssh-agent-$(hostname -s 2>/dev/null || hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null)"
+	ln -sf "$SSH_AUTH_SOCK" "$_byobu_agent"
+	export SSH_AUTH_SOCK="$_byobu_agent"
+	unset _byobu_agent
 fi
 
 # Fallback terminfo
 [ -z "$BYOBU_DEFAULT_TERM" ] && BYOBU_DEFAULT_TERM="screen"
 
 # Color terminfo to use, if possible
-[ -z "$BYOBU_COLOR_TERM" ] && BYOBU_COLOR_TERM="screen-256color"
+# Prefer tmux-256color over screen-256color for the tmux backend: screen-256color
+# defines smso=\E[3m (standout = italic escape code) with no sitm, causing tmux
+# to map italic requests to standout mode which renders as reverse video on the
+# outer terminal. tmux-256color correctly separates smso=\E[7m and sitm=\E[3m.
+if [ -z "$BYOBU_COLOR_TERM" ]; then
+	if [ "$BYOBU_BACKEND" = "tmux" ] && infocmp tmux-256color >/dev/null 2>&1; then
+		BYOBU_COLOR_TERM="tmux-256color"
+	else
+		BYOBU_COLOR_TERM="screen-256color"
+	fi
+fi
 
 # Check if our terminfo supports 256 colors
 CAN_SHOW_COLORS=
@@ -223,6 +292,17 @@ export BYOBU_TERM
 # Save session info
 [ -n "$DBUS_SESSION_BUS_ADDRESS" ] && printf "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS\n" > "$BYOBU_RUN_DIR/sockets"
 [ -n "$SESSION_MANAGER" ] && printf "SESSION_MANAGER=$SESSION_MANAGER\n" >> "$BYOBU_RUN_DIR/sockets"
+
+# Preflight: if no tmux server is running yet, validate the config so any
+# syntax error is shown to the user rather than swallowed by exec.  LP: #1960236
+if [ "$BYOBU_BACKEND" = "tmux" ] && ! tmux list-sessions >/dev/null 2>&1; then
+	_byobu_tmux_err=$(tmux start-server 2>&1 >/dev/null) || true
+	if [ -n "$_byobu_tmux_err" ]; then
+		printf "byobu: tmux configuration error:\n%s\n" "$_byobu_tmux_err" >&2
+		exit 1
+	fi
+	unset _byobu_tmux_err
+fi
 
 # Now let's execute the backend!
 if [ "$#" = "0" ]; then

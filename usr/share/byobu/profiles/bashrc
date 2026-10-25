@@ -29,7 +29,8 @@ esac
 [ -r "$BYOBU_PREFIX/lib/byobu/include/dirs" ] && . "$BYOBU_PREFIX/lib/byobu/include/dirs"
 
 byobu_prompt_git() { git branch 2>/dev/null | sed -e "/^[^*]/d" -e "s/* \(.*\)/ (\1)/"; }
-byobu_prompt_status() { printf "%s" "[$?]"; }
+byobu_prompt_status() { printf "%s" "[$_byobu_exit_code]"; }
+_byobu_save_exit() { _byobu_exit_code=$?; }
 byobu_prompt_symbol() { [ "$USER" = "root" ] && printf "%s" "#" || printf "%s" "\$"; }
 byobu_prompt_runtime() {
 	# Calculate the approximate runtime of the previous command
@@ -53,10 +54,20 @@ byobu_prompt_runtime() {
 	[ "$hours" = "0" ] && hours= || hours="${hours}h "
 	[ "$minutes" = "0" ] && minutes= || minutes="${minutes}m "
 	str="${days}${hours}${minutes}${seconds}.${microseconds}s"
-	printf "[%s]" "$str" 1>&2
+	printf "[%s]" "$str"
+	rm -f "$BYOBU_RUN_DIR/timer.$$"
 }
 # Requires Bash 4.x
-export PS0='$(printf "%s" ${EPOCHREALTIME/[^0-9]/} >"$BYOBU_RUN_DIR/timer.$$")'
+# Capture $? into _byobu_exit_code before PROMPT_COMMAND runs anything else that
+# might clobber it; PS1 subshells (byobu_prompt_runtime, byobu_prompt_status) each
+# reset $?, so we must save it here rather than reading $? inside byobu_prompt_status.
+if [ -z "${PROMPT_COMMAND}" ]; then
+    PROMPT_COMMAND="_byobu_save_exit"
+else
+    PROMPT_COMMAND="_byobu_save_exit; ${PROMPT_COMMAND}"
+fi
+# Only set PS0 if BYOBU_RUN_DIR is set (i.e., inside byobu)
+[ -d "$BYOBU_RUN_DIR" ] && export PS0='$(printf "%s" ${EPOCHREALTIME/[^0-9]/} >"$BYOBU_RUN_DIR/timer.$$")'
 
 case "$BYOBU_DISTRO" in
 	"Ubuntu")
@@ -72,7 +83,7 @@ case "$BYOBU_DISTRO" in
 		export LESS_TERMCAP_us=$(printf '\e[04;38;5;139m') # enter underline mode – underline aubergine
 		# Use Ubuntu themed dircolors
 		if [ -e "${BYOBU_PREFIX}/share/byobu/profiles/dircolors" ]; then
-			dircolors "${BYOBU_PREFIX}/share/byobu/profiles/dircolors" > "$BYOBU_RUN_DIR/dircolors"
+			dircolors "${BYOBU_PREFIX}/share/byobu/profiles/dircolors" >| "$BYOBU_RUN_DIR/dircolors"
 			. "$BYOBU_RUN_DIR/dircolors"
 		fi
 	;;

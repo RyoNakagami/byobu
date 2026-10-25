@@ -2,12 +2,19 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([byobu], [5.121], [http://byobu.org])
+AC_INIT([byobu], [7.23], [https://byobu.org])
 AC_CONFIG_SRCDIR([usr/bin/byobu.in])
 AM_INIT_AUTOMAKE([foreign])
 AC_PROG_LN_S
+AC_PROG_MKDIR_P
 
 # Checks for programs.
+# msgfmt compiles po/*.po into installed .mo catalogs (see po/Makefile.am).
+# Not required: byobu runs fine without translations, so a missing msgfmt
+# only skips that install step rather than failing the whole build.
+AC_CHECK_PROGS([MSGFMT], [msgfmt])
+AS_IF([test -z "$MSGFMT"],
+  [AC_MSG_WARN([msgfmt not found -- byobu will build without translation catalogs])])
 
 # Checks for libraries.
 
@@ -17,7 +24,18 @@ AC_PROG_LN_S
 
 # Checks for library functions.
 
+# Trustmux — mobile companion daemon. Enabled by default; pass
+# --disable-trustmux to skip installing the daemon, CLIs, and PWA assets
+# (e.g. for a minimal byobu install without a Python tornado runtime dep).
+AC_ARG_ENABLE([trustmux],
+  [AS_HELP_STRING([--disable-trustmux],
+    [do not install the Trustmux mobile companion daemon @<:@default=enabled@:>@])],
+  [enable_trustmux=$enableval],
+  [enable_trustmux=yes])
+AM_CONDITIONAL([ENABLE_TRUSTMUX], [test "x$enable_trustmux" = "xyes"])
+
 AC_OUTPUT(Makefile \
+	mobile/Makefile \
 	etc/byobu/Makefile \
 	etc/profile.d/Makefile \
 	etc/profile.d/Z97-byobu.sh \
@@ -26,8 +44,10 @@ AC_OUTPUT(Makefile \
 	usr/bin/byobu-ctrl-a \
 	usr/bin/byobu-disable \
 	usr/bin/byobu-disable-prompt \
+	usr/bin/byobu-disable-shell-integration \
 	usr/bin/byobu-enable \
 	usr/bin/byobu-enable-prompt \
+	usr/bin/byobu-enable-shell-integration \
 	usr/bin/byobu-export \
 	usr/bin/byobu-janitor \
 	usr/bin/byobu-launch \
@@ -54,6 +74,7 @@ AC_OUTPUT(Makefile \
 	usr/share/byobu/desktop/Makefile \
 	usr/share/byobu/keybindings/Makefile \
 	usr/share/byobu/pixmaps/Makefile \
+	usr/share/byobu/pixmaps/highcontrast/Makefile \
 	usr/share/byobu/profiles/Makefile \
 	usr/share/byobu/status/Makefile \
 	usr/share/byobu/tests/Makefile \
@@ -62,4 +83,6 @@ AC_OUTPUT(Makefile \
 	usr/share/doc/byobu/Makefile \
 	usr/lib/byobu/Makefile \
 	usr/lib/byobu/include/Makefile \
-	usr/share/man/man1/Makefile usr/bin/Makefile)
+	usr/share/sounds/byobu/Makefile \
+	usr/share/man/man1/Makefile usr/bin/Makefile \
+	po/Makefile)

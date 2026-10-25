@@ -44,26 +44,38 @@ fi
 [ -r "$BYOBU_CONFIG_DIR/socketdir" ] && . "$BYOBU_CONFIG_DIR/socketdir"
 
 # Create and export the runtime cache directory
-if [ -w /dev/shm ]; then
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
 	# Use shm for performance, if possible
-	for i in /dev/shm/$PKG-$USER-*; do
-		if [ -d "$i" ] && [ -O "$i" ]; then
-			export BYOBU_RUN_DIR="$i"
-			break
-		fi
-	done
+	_byobu_find_run_dir() {
+		# byobu-launch is sourced into zsh logins, where an unmatched glob
+		# aborts this whole file (leaving BYOBU_RUN_DIR empty) unless
+		# null_glob is set; local_options keeps it out of the user's shell
+		[ -n "$ZSH_VERSION" ] && setopt local_options null_glob
+		local i
+		for i in /dev/shm/$PKG-$USER-*; do
+			if [ -d "$i" ] && [ -O "$i" ]; then
+				export BYOBU_RUN_DIR="$i"
+				break
+			fi
+		done
+	}
+	_byobu_find_run_dir
+	unset -f _byobu_find_run_dir
 	# Still empty, make a new one
 	if [ ! -d "$BYOBU_RUN_DIR" ] || [ ! -O "$BYOBU_RUN_DIR" ]; then
 		export BYOBU_RUN_DIR=$(mktemp -d /dev/shm/$PKG-$USER-XXXXXXXX)
+		# It holds scrollback dumps and status caches; keep them ours
+		chmod 700 "$BYOBU_RUN_DIR" 2>/dev/null || true
 	fi
 fi
 if [ ! -d "$BYOBU_RUN_DIR" ] || [ ! -O "$BYOBU_RUN_DIR" ] || [ ! -w "$BYOBU_RUN_DIR" ]; then
 	# For distros that don't have a /dev/shm, use local disk
-	if [ -d "$XDG_CACHE_HOME" ]; then
+	if [ -n "$XDG_CACHE_HOME" ]; then
 		# Use XDG, as some users insist on such nonsense :-)
 		export BYOBU_RUN_DIR="$XDG_CACHE_HOME/$PKG"
 	else
 		# But if not, we'll use a cache directory
 		export BYOBU_RUN_DIR="$HOME/.cache/$PKG"
 	fi
+	mkdir -p -m 700 "$BYOBU_RUN_DIR" 2>/dev/null || true
 fi

@@ -1,0 +1,2345 @@
+#!/usr/bin/env python3
+"""Trustmux daemon — mobile companion for Byobu/tmux sessions."""
+
+import argparse
+import asyncio
+import base64
+from datetime import datetime
+import difflib
+import getpass
+import glob
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import time
+from collections import deque
+from collections.abc import Sequence
+from pathlib import Path
+from urllib.parse import urlparse
+
+import tornado.httpserver
+import tornado.iostream
+import tornado.netutil
+import tornado.web
+import tornado.websocket
+
+from trustmux._advertise import AdvertiseError, resolve, resolve_sources
+from trustmux._paths import (Instance, check_sock_path, machines_file,
+                             migrate_legacy_layout, resolve_instance,
+                             socket_is_live, tailscale_argv)
+
+def _resolve_version() -> str:
+    import subprocess as _sp
+    # Prefer the full Debian package version (e.g. 7.14-1~local1) when
+    # installed via .deb — gives the exact build including local iterators.
+    try:
+        v = _sp.check_output(
+            ["dpkg-query", "-W", "-f=${Version}", "byobu"],
+            stderr=_sp.DEVNULL, text=True,
+        ).strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    # pip / PyPI install: metadata carries the tag version (e.g. 7.14rc1).
+    try:
+        from importlib.metadata import version as _pkg_version
+        return _pkg_version("trustmux")
+    except Exception:
+        pass
+    # Dev tree fallback.
+    from trustmux import __version__
+    return __version__
+
+_DAEMON_VERSION = _resolve_version()
+
+# ---------------------------------------------------------------------------
+# Pairing & session state
+# ---------------------------------------------------------------------------
+
+_pair_code: str = ""
+_pair_code_expiry: float = 0.0        # wall-clock time, for human display only
+_pair_code_mono_expiry: float = 0.0   # monotonic time, for expiry check
+_pair_attempts: int = 0               # wrong guesses at the current code, all sources
+_pair_attempts_by_ip: dict[str, int] = {}   # wrong guesses per source address
+_pair_paired_ip: str = ""             # IP that consumed the last code, for admin "pair_status"
+# Wrong guesses are counted per source address so that one peer -- or one web
+# page in some browser on the tailnet -- cannot lock the real phone out by
+# burning the budget; the total cap still bounds an attacker with many
+# addresses.  3 per address and 9 overall against a million codes leaves
+# brute force at under one in a hundred thousand per pairing window.
+_MAX_PAIR_ATTEMPTS: int = 3           # per source address
+_MAX_PAIR_ATTEMPTS_TOTAL: int = 9     # across all addresses
+_PAIR_CODE_TTL: int = 60              # 60 seconds — keep the window tight
+_TOKEN_EXPIRY_DAYS: int = 90          # sessions expire after 90 days of inactivity
+_sessions: dict[str, dict] = {}      # token → {ip, paired_at, label, last_used}
+_ws_clients: dict[str, set] = {}     # token → set[WsHandler] — closed on unpair
+_https_mode: bool = False             # set by --https or --self-signed; enables Secure cookie
+_listen: dict = {}                    # bound host/port/scheme, served by admin "info"
+# True only for --https (the Unix-socket/loopback tailscale-serve modes), never
+# for --self-signed (start-direct: also TLS, also folds into _https_mode above,
+# but exposed straight to 0.0.0.0 with no proxy in front at all). Narrower than
+# _https_mode on purpose: _external_host() must trust X-Forwarded-Host exactly
+# when, and only when, tailscale serve -- not an arbitrary direct client -- is
+# the one who could have set it. Mirrors xheaders, which gates the same way.
+_trust_forwarded_host: bool = False
+
+# Which instance's files this daemon owns; repointed by --name.
+INSTANCE      = Instance()
+STATE_DIR     = INSTANCE.state
+TOKENS_FILE   = INSTANCE.tokens_file
+ADMIN_SOCK    = INSTANCE.sock
+CERT_FILE     = INSTANCE.cert_file
+KEY_FILE      = INSTANCE.key_file
+MACHINES_FILE = machines_file()   # shared by every instance
+
+
+def _set_instance(inst: Instance) -> None:
+    """Point this daemon's files at inst. Must run before _load_tokens()."""
+    global INSTANCE, STATE_DIR, TOKENS_FILE, ADMIN_SOCK, CERT_FILE, KEY_FILE
+    INSTANCE    = inst
+    STATE_DIR   = inst.state
+    TOKENS_FILE = inst.tokens_file
+    ADMIN_SOCK  = inst.sock
+    CERT_FILE   = inst.cert_file
+    KEY_FILE    = inst.key_file
+
+
+_INSTALLED_STATIC = Path("/usr/share/trustmux/static")
+_DEV_STATIC       = Path(__file__).parent / "static"
+STATIC            = _INSTALLED_STATIC if _INSTALLED_STATIC.is_dir() else _DEV_STATIC
+
+def _get_server_tz() -> str:
+    try:
+        with open("/etc/timezone") as _f:
+            return _f.read().strip()
+    except Exception:
+        return "UTC"
+
+_SERVER_TZ = _get_server_tz()
+
+def _load_tokens() -> None:
+    if not TOKENS_FILE.exists():
+        return
+    try:
+        data = json.loads(TOKENS_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        expiry_cutoff = time.time() - _TOKEN_EXPIRY_DAYS * 86400
+        valid = {
+            t: s for t, s in data.items()
+            if isinstance(t, str) and isinstance(s, dict)
+            and "ip" in s and "paired_at" in s
+            and float(s.get("last_used", s["paired_at"])) > expiry_cutoff
+        }
+        expired = sum(
+            1 for t, s in data.items()
+            if isinstance(t, str) and isinstance(s, dict)
+            and "paired_at" in s
+            and float(s.get("last_used", s["paired_at"])) <= expiry_cutoff
+        )
+        malformed = len(data) - len(valid) - expired
+        if expired:
+            print(f"Info: expired {expired} stale session(s) from {TOKENS_FILE}", flush=True)
+        if malformed:
+            print(f"Warning: skipped {malformed} malformed record(s) in {TOKENS_FILE}", flush=True)
+        _sessions.update(valid)
+    except Exception as e:
+        print(f"Warning: could not load {TOKENS_FILE}: {e} — all sessions lost", flush=True)
+
+def _save_tokens() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    STATE_DIR.chmod(0o700)
+    tmp = TOKENS_FILE.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(_sessions, f, indent=2)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, TOKENS_FILE)
+
+def _generate_pair_code() -> str:
+    global _pair_code, _pair_code_expiry, _pair_code_mono_expiry, _pair_attempts
+    global _pair_paired_ip
+    _pair_code = f"{secrets.randbelow(1000000):06d}"
+    _pair_code_expiry = time.time() + _PAIR_CODE_TTL
+    _pair_code_mono_expiry = time.monotonic() + _PAIR_CODE_TTL
+    _pair_attempts = 0
+    _pair_attempts_by_ip.clear()
+    _pair_paired_ip = ""
+    return _pair_code
+
+def _print_pair_code() -> None:
+    fmt = f"{_pair_code[:3]}-{_pair_code[3:]}"
+    expiry = datetime.fromtimestamp(_pair_code_expiry).strftime("%H:%M:%S")
+    bar = "═" * 50
+    print(f"\n{bar}")
+    print(f"  Trustmux pairing code:  {fmt}  (expires {expiry})")
+    print(f"{bar}\n", flush=True)
+
+def _valid_session_token(token: str) -> bool:
+    if not token:
+        return False
+    token_bytes = token.encode()
+    expiry_cutoff = time.time() - _TOKEN_EXPIRY_DAYS * 86400
+    for k, s in _sessions.items():
+        if hmac.compare_digest(token_bytes, k.encode()):
+            if float(s.get("last_used", s.get("paired_at", 0))) <= expiry_cutoff:
+                return False
+            s["last_used"] = time.time()
+            return True
+    return False
+
+# ---------------------------------------------------------------------------
+# Tailscale IP detection
+# ---------------------------------------------------------------------------
+
+_IPV4_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+
+def _tailscale_ip() -> str | None:
+    try:
+        r = subprocess.run(tailscale_argv("ip", "-4"), capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            ip = r.stdout.strip().splitlines()[0].strip()
+            if _IPV4_RE.match(ip):
+                return ip
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["ip", "-4", "addr", "show", "tailscale0"],
+                           capture_output=True, text=True, timeout=3)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", r.stdout)
+        if m and _IPV4_RE.match(m.group(1)):
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _get_server_ip() -> str:
+    """Best-effort primary IP for the connection-info popup only — not used
+    for binding. Prefers the Tailscale IP (matches what isTailscaleHost() on
+    the client checks for), falling back to whichever local interface the OS
+    would route through to reach the public internet (no packets actually
+    sent — UDP connect() just consults the routing table).
+    """
+    ip = _tailscale_ip()
+    if ip:
+        return ip
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# Computed once at daemon startup (may shell out to `tailscale`) — never
+# recomputed per-message, unlike server_ts which must be fresh every time.
+_SERVER_IP = _get_server_ip()
+
+# ---------------------------------------------------------------------------
+# ANSI stripping
+# ---------------------------------------------------------------------------
+
+ANSI_RE = re.compile(
+    r'\x1b\[[0-9;]*[mGKHFJABCDsuhrPX@L]'
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'
+    r'|\x1b[()][AB012]'
+    r'|\x1b[MDEHO78=>]'
+    r'|\r'
+)
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub('', text)
+
+def _smarter_pane_name(pane_pid_str: str, fallback: str) -> str:
+    """Walk /proc tree from pane_pid to find the leaf foreground process name.
+
+    tmux's pane_current_command only sees the direct child of the shell (e.g.
+    'sh' when running a shell-script wrapper like 'claude').  Reading
+    /proc/<pid>/task/<pid>/children lets us follow the chain down to the real
+    foreground process without spawning extra subprocesses.
+    """
+    try:
+        pid = int(pane_pid_str)
+    except (ValueError, TypeError):
+        return fallback
+    seen: set[int] = set()
+    for _ in range(6):
+        if pid in seen:
+            break
+        seen.add(pid)
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+        except OSError:
+            break
+        if not children:
+            try:
+                name = Path(f"/proc/{pid}/comm").read_text().strip()
+                return name or fallback
+            except OSError:
+                break
+        try:
+            pid = int(children[0])
+        except (ValueError, IndexError):
+            break
+    return fallback
+
+# ---------------------------------------------------------------------------
+# tmux interface — thin wrappers around the tmux CLI
+# ---------------------------------------------------------------------------
+
+def _tmux(*args) -> str:
+    result = subprocess.run(
+        ["tmux"] + list(args),
+        capture_output=True, text=True, timeout=5
+    )
+    return result.stdout
+
+def tmux_list_sessions() -> list[dict]:
+    raw = _tmux("list-sessions", "-F",
+                "#{session_id}\t#{session_name}\t#{session_attached}")
+    sessions = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        sid, name = parts[0], parts[1]
+        attached = parts[2] == "1" if len(parts) > 2 else False
+        sessions.append({
+            "id": sid,
+            "name": name,
+            "attached": attached,
+            "windows": tmux_list_windows(sid),
+        })
+    return sessions
+
+def tmux_list_windows(session_id: str) -> list[dict]:
+    raw = _tmux("list-windows", "-t", session_id, "-F",
+                "#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}")
+    windows = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        wid, idx, name, active = parts[0], parts[1], parts[2], parts[3]
+        try:
+            index = int(idx)
+        except ValueError:
+            continue
+        windows.append({
+            "id": wid,
+            "index": index,
+            "name": name,
+            "active": active == "1",
+            "panes": tmux_list_panes(wid),
+        })
+    return windows
+
+def tmux_list_panes(window_id: str) -> list[dict]:
+    # pane_title is program-controlled (OSC 2) and may contain tabs, so it
+    # goes last and the split is bounded to keep it from shifting pid/dead.
+    raw = _tmux("list-panes", "-t", window_id, "-F",
+                "#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_current_command}\t#{pane_pid}\t#{pane_dead}\t#{pane_title}")
+    panes = []
+    for line in raw.splitlines():
+        parts = line.split("\t", 6)
+        if len(parts) < 3:
+            continue
+        pane_id_str = parts[0]
+        try:
+            idx = int(parts[1])
+        except ValueError:
+            continue
+        active = parts[2] == "1"
+        cmd     = parts[3] if len(parts) > 3 else ""
+        pid_str = parts[4] if len(parts) > 4 else ""
+        dead    = parts[5] == "1" if len(parts) > 5 else False
+        title   = parts[6] if len(parts) > 6 else ""
+        if not dead and pid_str:
+            cmd = _smarter_pane_name(pid_str, cmd)
+        panes.append({
+            "id": pane_id_str,
+            "index": idx,
+            "active": active,
+            "command": cmd,
+            "title": title,
+            "dead": dead,
+        })
+    return panes
+
+def tmux_capture_pane(pane_id: str, history_lines: int = 200, ansi: bool = False,
+                      join: bool = False) -> str:
+    args = ["capture-pane", "-t", pane_id, "-p"]
+    if ansi:
+        args.append("-e")
+    if join:
+        # -J joins lines tmux soft-wrapped at the pane width, so the client
+        # can reflow them at its own width.
+        args.append("-J")
+    raw = _tmux(*args, "-S", f"-{history_lines}")
+    if not ansi:
+        raw = strip_ansi(raw)
+    return raw
+
+# Cap how large a pane's captured window can be before _diff_pane_lines
+# skips searching and the caller falls back to a full replacement -- the
+# search below is worst-case quadratic in line count. Default
+# subscriptions ask for 300 lines (see the "lines" default in the
+# subscribe handler); this only matters for a client deliberately
+# requesting a much bigger window (up to _MAX_HISTORY_LINES).
+_MAX_DIFF_LINES = 2000
+
+def _diff_pane_lines(old_lines: list[str], new_lines: list[str]) -> tuple[int, list[str]] | None:
+    """Find the smallest number of lines to drop from the front of
+    old_lines so the remainder lines up with a prefix of new_lines --
+    i.e. the captured window just slid down by that many lines, which is
+    what a busy pane's output looks like tick to tick: old lines scroll
+    out the top, new ones appear at the bottom. Returns
+    (drop_count, appended_lines).
+
+    Always finds *some* match: dropping every line of old_lines leaves an
+    empty tail, which trivially lines up with any prefix, so the search
+    can't fail to terminate. That degenerate case (drop everything,
+    append everything) is exactly correct behavior for a change that
+    isn't a simple append -- a clear, a redraw, an in-place progress bar
+    -- so there's no separate fallback path to get wrong, just a result
+    that happens to carry the whole new pane instead of a small tail.
+
+    Returns None without searching if old_lines is too long to diff
+    cheaply (see _MAX_DIFF_LINES); the caller should send a full
+    replacement instead.
+    """
+    n = len(old_lines)
+    if n > _MAX_DIFF_LINES:
+        return None
+    for drop in range(n + 1):
+        tail = old_lines[drop:]
+        if new_lines[:len(tail)] == tail:
+            return drop, new_lines[len(tail):]
+    return n, new_lines  # unreachable: drop == n always matches above
+
+def tmux_cursor(pane_id: str) -> dict | None:
+    """Cursor position for the subscribed pane, pre-mapped for the client.
+
+    #{cursor_y} is a row on the visible screen; a piped capture-pane keeps
+    trailing blank screen rows (_clamp_cursor defends against a tmux that
+    trims them), so the visible screen is exactly the capture's trailing
+    #{pane_height} lines and the cursor's line sits
+    pane_height - 1 - cursor_y lines from the end of the capture. Sending
+    that from-the-end index keeps the client mapping independent of how much
+    history the capture holds. cursor_x rides along for clients that want
+    column fidelity. None on any parse trouble: the client then falls back
+    to its end-of-buffer anchor. The capture and this call are two separate
+    tmux invocations, so the cursor can be one screen-state newer than the
+    content it rides with; it self-corrects on the next poll.
+    """
+    return _cursor_from_raw(_cursor_fields(pane_id))
+
+_CURSOR_FMT = "#{cursor_x} #{cursor_y} #{pane_height} #{pane_width}"
+
+def _join_cursor(content: str, x: int, y: int, height: int,
+                 width: int) -> dict | None:
+    """Map a screen cursor into joined (-J) capture coordinates.
+
+    A joined capture merges soft-wrapped rows, so #{cursor_y} no longer
+    indexes capture lines. Each joined line occupies ceil(cells/width)
+    screen rows; walking joined lines from the capture's end and summing
+    those rows locates the line holding the cursor's row, and the row's
+    position within that line turns cursor_x into an offset into the joined
+    line. Cells are approximated by code points of the ANSI-stripped line,
+    the same cell-vs-code-point approximation the client's anchor already
+    makes, so double-width characters drift the anchor the same way they
+    always did. None when the geometry is unusable; the client then falls
+    back to its end-of-buffer anchor.
+    """
+    if width <= 0 or not 0 <= y < height:
+        return None
+    lines = strip_ansi(content).split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()                        # the capture's closing newline
+    rows_below = height - 1 - y
+    acc = 0
+    for i in range(len(lines) - 1, -1, -1):
+        rows = max(1, -(-len(lines[i]) // width))
+        if acc + rows > rows_below:
+            row_from_top = rows - 1 - (rows_below - acc)
+            return {"cursor_x": row_from_top * width + x,
+                    "cursor_from_end": len(lines) - 1 - i}
+        acc += rows
+    return None
+
+def _cursor_fields(pane_id: str) -> str:
+    return _tmux("display-message", "-p", "-t", pane_id, _CURSOR_FMT)
+
+def _parse_cursor_fields(raw: str) -> tuple[int, int, int, int] | None:
+    """(x, y, height, width) from a raw '#{cursor_x}\\t#{cursor_y}\\t
+    #{pane_height}\\t#{pane_width}'-shaped reply, or None on any parse
+    trouble -- the one place this validation lives, so _cursor_from_raw and
+    cm_join_cursor can't drift apart on what counts as a valid reply."""
+    parts = raw.split()
+    if len(parts) != 4:
+        return None
+    try:
+        x, y, height, width = (int(p) for p in parts)
+    except ValueError:
+        return None
+    if not 0 <= y < height:
+        return None
+    return x, y, height, width
+
+def _cursor_from_raw(raw: str) -> dict | None:
+    fields = _parse_cursor_fields(raw)
+    if fields is None:
+        return None
+    x, y, height, _width = fields
+    return {"cursor_x": x, "cursor_from_end": height - 1 - y}
+
+def _clamp_cursor(cursor: dict | None, content: str) -> dict | None:
+    """Drop the cursor when the capture cannot contain its line.
+
+    tmux_cursor's mapping assumes a piped capture-pane keeps trailing blank
+    screen rows (verified on tmux 3.7b, but version behavior, not spec). A
+    tmux that trims them would make cursor_from_end point into scrollback;
+    dropping the fields degrades to the client's end-of-buffer anchor.
+    """
+    if cursor is None:
+        return None
+    if not content:
+        return None
+    lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+    if cursor["cursor_from_end"] >= lines:
+        return None
+    return cursor
+
+def tmux_new_session(name: str) -> None:
+    _tmux("new-session", "-d", "-s", name)
+
+def tmux_new_window(session_id: str, name: str = "") -> None:
+    args = ["new-window", "-t", session_id]
+    if name:
+        args += ["-n", name]
+    _tmux(*args)
+
+def tmux_new_pane(window_id: str) -> None:
+    _tmux("split-window", "-t", window_id)
+
+def tmux_kill_pane(pane_id: str) -> None:
+    _tmux("kill-pane", "-t", pane_id)
+
+def tmux_kill_window(window_id: str) -> None:
+    _tmux("kill-window", "-t", window_id)
+
+def tmux_kill_session(session_id: str) -> None:
+    _tmux("kill-session", "-t", session_id)
+
+# `send-keys -l` delivers the whole literal string as one paste-like burst.
+# Some TUIs (e.g. Codex CLI) detect paste-like input by inter-keystroke
+# timing and, for a short window afterward, treat Enter as a newline inside
+# the paste rather than submit — sending Enter immediately lands inside that
+# window, so Enter is silently swallowed. Codex's window is 120ms; settle
+# past it before sending Enter. https://github.com/dustinkirkland/byobu/issues/115
+#
+# Shells have no such heuristics, so when the process reading the pane's tty
+# is a bare shell prompt the settle is 150ms of pure added latency on every
+# submitted command; skip it there and keep it for everything else, where a
+# swallowed Enter costs far more than the wait.
+_PASTE_BURST_SETTLE = 0.15
+
+_SHELL_NAMES = frozenset(
+    {"bash", "zsh", "fish", "sh", "dash", "ash", "ksh", "tcsh", "csh",
+     "nu", "xonsh", "elvish", "pwsh", "powershell", "osh", "oil"}
+    # A closed set can never cover every shell (a renamed/custom binary);
+    # let a user whose shell keeps paying the settle add it without a code
+    # change, e.g. TRUSTMUX_EXTRA_SHELLS=my-shell,another-shell.
+    | {n.strip() for n in os.environ.get("TRUSTMUX_EXTRA_SHELLS", "").split(",") if n.strip()})
+
+def _pane_reader_is_shell(pane_id: str) -> bool:
+    """True when the pane's foreground process is a plain shell prompt.
+
+    Walks from pane_pid to the deepest first-child, same as the pane-name
+    display: a shell with a child is running that child, and the child gets
+    the settle. Any doubt (unreadable pid, unknown name) returns False so
+    the caller keeps the safe path.
+    """
+    pid = _tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip()
+    if not pid.isdigit():
+        return False
+    return _smarter_pane_name(pid, "") in _SHELL_NAMES
+
+def tmux_send_keys(pane_id: str, keys: str, enter: bool = True, literal: bool = True) -> None:
+    if literal:
+        _tmux("send-keys", "-t", pane_id, "-l", keys)
+    else:
+        _tmux("send-keys", "-t", pane_id, keys)
+    if enter:
+        if literal and not _pane_reader_is_shell(pane_id):
+            time.sleep(_PASTE_BURST_SETTLE)
+        _tmux("send-keys", "-t", pane_id, "Enter")
+
+def tmux_rename_window(window_id: str, name: str) -> None:
+    _tmux("rename-window", "-t", window_id, name)
+
+def tmux_rename_session(session_id: str, name: str) -> None:
+    _tmux("rename-session", "-t", session_id, name)
+
+# ---------------------------------------------------------------------------
+# Byobu status line — reads pre-computed cache from /dev/shm
+# ---------------------------------------------------------------------------
+
+_BG = {
+    "black": "#1e1e1e",   "red": "#b03030",    "green": "#2a7a2a",
+    "yellow": "#8a8000",  "blue": "#2050b0",    "magenta": "#7a2a7a",
+    "cyan": "#1a7070",    "white": "#8a9090",
+    "brightblack": "#484848", "brightred": "#cc4444",   "brightgreen": "#44bb44",
+    "brightyellow": "#cccc00", "brightblue": "#4466cc",  "brightmagenta": "#bb44bb",
+    "brightcyan": "#44bbbb",   "brightwhite": "#dddddd",
+}
+_LIGHT_BG = {"white", "brightwhite", "brightgreen", "brightyellow", "brightcyan", "brightblue"}
+
+def _colour256_to_css(name: str) -> str | None:
+    """Convert a tmux colour<N> 256-color name to a CSS hex string."""
+    if not name.startswith("colour"):
+        return None
+    try:
+        n = int(name[6:])
+    except ValueError:
+        return None
+    if 16 <= n <= 231:
+        # 6×6×6 RGB cube
+        n -= 16
+        levels = (0, 95, 135, 175, 215, 255)
+        r, g, b = levels[n // 36], levels[(n % 36) // 6], levels[n % 6]
+        return f"#{r:02x}{g:02x}{b:02x}"
+    if 232 <= n <= 255:
+        # grayscale ramp
+        v = 8 + (n - 232) * 10
+        return f"#{v:02x}{v:02x}{v:02x}"
+    return None
+_TMUX_ATTR = re.compile(r"#\[[^\]]*\]")
+_CSS_HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+def _first_attr(content: str, prefix: str) -> str | None:
+    for m in _TMUX_ATTR.finditer(content):
+        inner = m.group(0)[2:-1]
+        for part in inner.split(","):
+            part = part.strip()
+            if part.startswith(prefix):
+                val = part[len(prefix):]
+                return val if val else None
+    return None
+
+def _byobu_shm() -> Path | None:
+    user = getpass.getuser()
+    uid = os.getuid()
+    for hit in sorted(glob.glob(f"/dev/shm/byobu-{user}-*")):
+        try:
+            if os.stat(hit).st_uid == uid:
+                return Path(hit)
+        except OSError:
+            continue
+    return None
+
+def _read_byobu_status_config() -> tuple[list[str], list[str]]:
+    """Parse user's byobu status config; return (left_metrics, right_metrics)."""
+    left_raw  = "logo release session"
+    right_raw = "uptime load_average cpu_count cpu_freq memory disk date time"
+    for path in [
+        Path.home() / ".config" / "byobu" / "status",
+        Path.home() / ".byobu" / "status",
+        Path("/usr/share/byobu/status/status"),
+    ]:
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("tmux_left="):
+                    left_raw = line.split("=", 1)[1].strip().strip('"')
+                elif line.startswith("tmux_right=") and not line.startswith("#"):
+                    right_raw = line.split("=", 1)[1].strip().strip('"')
+            break
+        except OSError:
+            continue
+
+    def _parse(raw: str) -> list[str]:
+        return [m for m in raw.split() if m and not m.startswith("#")]
+
+    return _parse(left_raw), _parse(right_raw)
+
+def _make_chip(name: str, shm: Path) -> dict | None:
+    if not _BYOBU_METRIC_RE.match(name):
+        return None
+    status_dir = shm / "status.tmux"
+    if not status_dir.is_dir():
+        return None
+    fpath = status_dir / name
+    if not fpath.exists():
+        return None
+    try:
+        raw = fpath.read_text()
+    except OSError:
+        return None
+    text = _TMUX_ATTR.sub("", raw).strip()
+    text = re.sub(r'([KMGT])(\d)', r'\1 \2', text)
+    if not text:
+        return None
+    bg_name = _first_attr(raw, "bg=")
+    if bg_name and _CSS_HEX_RE.match(bg_name):
+        bg_css = bg_name
+    elif bg_name and bg_name.startswith("colour"):
+        bg_css = _colour256_to_css(bg_name) or "#2d2d2d"
+    else:
+        bg_css = _BG.get(bg_name or "", "#2d2d2d")
+    text_css = "#111111" if bg_name in _LIGHT_BG else "#eeeeee"
+    return {"label": name, "text": text, "bg": bg_css, "color": text_css}
+
+def read_byobu_status() -> dict:
+    shm = _byobu_shm()
+    left_names, right_names = _read_byobu_status_config()
+
+    def _chips(names: list[str]) -> list[dict]:
+        if not shm:
+            return []
+        return [c for name in names if (c := _make_chip(name, shm))]
+
+    return {"left": _chips(left_names), "right": _chips(right_names)}
+
+# ---------------------------------------------------------------------------
+# Tornado HTTP handlers
+# ---------------------------------------------------------------------------
+
+def _inline_script_hashes() -> list[str]:
+    """CSP source expressions for the inline <script> blocks in index.html.
+
+    Computed from the file we actually serve, so the theme bootstrap in <head>
+    is allowed to run without 'unsafe-inline' and cannot silently drift out of
+    step with the policy: any other inline script -- injected or added by
+    accident -- still has no matching hash and is blocked.
+    """
+    try:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return ["'sha256-" + base64.b64encode(
+                hashlib.sha256(m.group(1).encode("utf-8")).digest()).decode() + "'"
+            for m in re.finditer(r"<script>(.*?)</script>", html, re.S)]
+
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' " + " ".join(_inline_script_hashes()) + "; "
+    "style-src 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "img-src 'self'; "
+    # These do not inherit from default-src and so must be spelled out.
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+).replace("'self' ;", "'self';")
+
+class BaseHandler(tornado.web.RequestHandler):
+    """All handlers inherit this for security headers."""
+
+    def set_default_headers(self):
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.set_header("X-Frame-Options", "DENY")
+        self.set_header("Content-Security-Policy", _CSP)
+        self.set_header("Referrer-Policy", "no-referrer")
+        self.set_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if _https_mode:
+            self.set_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+    def json(self, obj: object, status: int = 200):
+        self.set_status(status)
+        self.set_header("Content-Type", "application/json")
+        self.finish(json.dumps(obj))
+
+
+class BaseAuthHandler(BaseHandler):
+    """Protected handlers inherit this; unauthenticated requests get 401."""
+
+    def set_default_headers(self):
+        super().set_default_headers()
+        self.set_header("Cache-Control", "no-store")
+
+    def prepare(self):
+        token = self.get_cookie("trustmux_session") or ""
+        if not _valid_session_token(token):
+            self.json({"error": "unauthorized"}, 401)
+
+
+# ── public endpoints ─────────────────────────────────────────────────────────
+
+class IndexHandler(BaseHandler):
+    async def get(self):
+        content = await asyncio.to_thread((STATIC / "index.html").read_text)
+        self.set_header("Content-Type", "text/html; charset=utf-8")
+        self.finish(content)
+
+
+class SvgHandler(BaseHandler):
+    async def get(self):
+        content = await asyncio.to_thread((STATIC / "trustmux.svg").read_bytes)
+        self.set_header("Content-Type", "image/svg+xml")
+        self.set_header("Cache-Control", "max-age=86400")
+        self.finish(content)
+
+
+class ManifestHandler(BaseHandler):
+    def get(self):
+        hostname = socket.gethostname().split('.')[0]
+        manifest = {
+            "name":             f"Trustmux · {hostname}",
+            "short_name":       hostname,
+            "description":      "Monitor and interact with your tmux/Byobu sessions from your phone.",
+            "start_url":        "/",
+            "display":          "standalone",
+            "background_color": "#141414",
+            "theme_color":      "#141414",
+            "icons": [
+                {"src": "/icons/icon-192.png?v=3", "sizes": "192x192",
+                 "type": "image/png", "purpose": "any"},
+                {"src": "/icons/icon-512.png?v=3", "sizes": "512x512",
+                 "type": "image/png", "purpose": "any maskable"},
+            ],
+        }
+        self.set_header("Content-Type", "application/manifest+json")
+        self.set_header("Cache-Control", "no-cache")
+        self.finish(json.dumps(manifest))
+
+
+class ServiceWorkerHandler(BaseHandler):
+    async def get(self):
+        content = await asyncio.to_thread((STATIC / "sw.js").read_bytes)
+        self.set_header("Content-Type", "application/javascript")
+        # Service workers must not be cached — browser re-checks on every load.
+        self.set_header("Cache-Control", "no-cache")
+        self.finish(content)
+
+
+class AppJsHandler(BaseHandler):
+    async def get(self):
+        content = await asyncio.to_thread((STATIC / "app.js").read_bytes)
+        self.set_header("Content-Type", "application/javascript")
+        self.set_header("Cache-Control", "no-cache")
+        self.finish(content)
+
+
+class IconHandler(BaseHandler):
+    async def get(self, filename: str):
+        if not re.match(r'^[\w\-]+\.png$', filename):
+            return self.json({"error": "not found"}, 404)
+        path = STATIC / "icons" / filename
+        if not path.exists():
+            return self.json({"error": "not found"}, 404)
+        content = await asyncio.to_thread(path.read_bytes)
+        self.set_header("Content-Type", "image/png")
+        self.set_header("Cache-Control", "no-cache")
+        self.finish(content)
+
+
+class FontHandler(BaseHandler):
+    async def get(self, filename: str):
+        if not re.match(r'^[\w\-]+\.woff2$', filename):
+            return self.json({"error": "not found"}, 404)
+        path = STATIC / "fonts" / filename
+        if not path.exists():
+            return self.json({"error": "not found"}, 404)
+        content = await asyncio.to_thread(path.read_bytes)
+        self.set_header("Content-Type", "font/woff2")
+        # Unlike icons/sw.js/app.js, this file never changes between
+        # releases without also changing its own filename (there is no
+        # cache-busting query param on the @font-face url), so a long-lived
+        # cache is safe and saves re-fetching ~150KB on every page load.
+        self.set_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.finish(content)
+
+
+class PingHandler(BaseHandler):
+    def get(self):
+        self.set_header("Cache-Control", "no-store")
+        token = self.get_cookie("trustmux_session") or ""
+        if _valid_session_token(token):
+            self.json({"auth": True, "hostname": socket.gethostname(), "version": _DAEMON_VERSION})
+        else:
+            self.json({"auth": False}, 401)
+
+
+def _external_host(request) -> str:
+    """The Host the browser actually dialed, as far as this handler can tell.
+
+    In serve mode `tailscale serve` proxies to the daemon over a Unix socket
+    or loopback port with its own Host header (typically "localhost"), and
+    carries the tailnet name the browser used in X-Forwarded-Host instead.
+    request.host is otherwise correct -- start-local and start-direct have no
+    proxy in front, so the browser's own Host reaches the daemon unchanged.
+
+    X-Forwarded-Host is trusted only when _trust_forwarded_host -- true for
+    --https (tailscale serve) alone, deliberately NOT for --self-signed
+    (start-direct): that mode also sets _https_mode (it needs the Secure
+    cookie attribute and reports an https:// scheme too) but is exposed
+    straight to 0.0.0.0 with no proxy in front, so a client there could set
+    its own X-Forwarded-Host to defeat the origin check this function feeds
+    (_cross_site, WsHandler.check_origin) if this trusted _https_mode
+    instead. The header is trustworthy exactly when, and only when,
+    tailscale serve -- not an arbitrary direct client -- is the one setting
+    it; xheaders is gated the same way, for the same reason.
+    """
+    if _trust_forwarded_host:
+        forwarded = request.headers.get("X-Forwarded-Host", "").strip()
+        if forwarded:
+            return forwarded
+    return request.host
+
+
+def _cross_site(request) -> bool:
+    """True if a browser says this request came from another site.
+
+    /pair is the one endpoint that has no cookie to protect it, and a wrong
+    guess costs the real phone one of its attempts, so a page on any other
+    origin must not be able to submit guesses through a visitor's browser.
+    Browsers label their own requests: Sec-Fetch-Site on modern ones, Origin on
+    all of them for POST.  A request carrying neither (curl, a native client)
+    is not a browser and is let through; the cookie-free budget below still
+    bounds it.
+    """
+    site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        return True
+    origin = request.headers.get("Origin", "").strip()
+    if origin and origin.lower() != "null":
+        if urlparse(origin).netloc.lower() != _external_host(request).lower():
+            return True
+    return False
+
+
+class PairHandler(BaseHandler):
+    async def post(self):
+        global _pair_attempts, _pair_code, _pair_code_expiry, _pair_code_mono_expiry
+        global _pair_paired_ip
+        ctype = self.request.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            # A cross-site HTML form can only send the three "simple" types;
+            # requiring JSON keeps a form post from being parsed as a guess.
+            return self.json({"error": "expected application/json"}, 415)
+        if _cross_site(self.request):
+            return self.json({"error": "cross-site request refused"}, 403)
+        if not _pair_code:
+            return self.json({"error": "no pairing code active — run trustmux-pair"}, 403)
+        if time.monotonic() > _pair_code_mono_expiry:
+            _pair_code = ""
+            return self.json({"error": "pairing code expired — run trustmux-pair again"}, 403)
+        ip = self.request.remote_ip  # respects xheaders automatically
+        if (_pair_attempts >= _MAX_PAIR_ATTEMPTS_TOTAL
+                or _pair_attempts_by_ip.get(ip, 0) >= _MAX_PAIR_ATTEMPTS):
+            return self.json({"error": "too many attempts — run trustmux-pair again"}, 429)
+        body_bytes = self.request.body
+        if len(body_bytes) > 1024:
+            return self.json({"error": "request too large"}, 413)
+        try:
+            body = json.loads(body_bytes)
+        except json.JSONDecodeError:
+            return self.json({"error": "invalid JSON"}, 400)
+        if not isinstance(body, dict):
+            return self.json({"error": "invalid JSON"}, 400)
+        code = re.sub(r"\D", "", str(body.get("code", "")))
+        if not hmac.compare_digest(code.encode(), _pair_code.encode()):
+            _pair_attempts += 1
+            _pair_attempts_by_ip[ip] = _pair_attempts_by_ip.get(ip, 0) + 1
+            left = min(_MAX_PAIR_ATTEMPTS - _pair_attempts_by_ip[ip],
+                       _MAX_PAIR_ATTEMPTS_TOTAL - _pair_attempts)
+            await asyncio.sleep(0.5)  # slow brute-force attempts
+            return self.json({"error": f"wrong code — {left} attempts left"}, 403)
+        # Valid — issue permanent session token; invalidate code (one device per code)
+        token = secrets.token_urlsafe(32)
+        # The label is shown on the operator's terminal by `trustmux unpair`;
+        # keep a paired device from planting escape sequences there.
+        label = re.sub(r"[^\x20-\x7e]", "?",
+                       self.request.headers.get("User-Agent", ""))[:120]
+        now = time.time()
+        _sessions[token] = {
+            "ip": ip,
+            "paired_at": now,
+            "last_used": now,
+            "label": label,
+        }
+        await asyncio.to_thread(_save_tokens)
+        _pair_code = ""
+        _pair_code_expiry = 0.0
+        _pair_code_mono_expiry = 0.0
+        _pair_attempts = 0
+        _pair_attempts_by_ip.clear()
+        _pair_paired_ip = ip
+        print(f"✓ Trustmux: device paired ({ip})", flush=True)
+        self.set_cookie(
+            "trustmux_session", token,
+            expires_days=_TOKEN_EXPIRY_DAYS,
+            httponly=True,
+            samesite="Strict",
+            secure=_https_mode,
+        )
+        self.json({"ok": True})
+
+
+class MachinesHandler(BaseAuthHandler):
+    async def get(self):
+        try:
+            current_url = f"{self.request.protocol}://{_external_host(self.request)}"
+            siblings = []
+            if MACHINES_FILE.exists():
+                raw = json.loads(await asyncio.to_thread(MACHINES_FILE.read_text))
+                if isinstance(raw, list):
+                    siblings = [s for s in raw
+                                if isinstance(s, dict) and "name" in s and "url" in s
+                                and re.match(r'^https://', s["url"])]
+            result = [{"name": "this machine", "url": current_url, "current": True}] + [
+                {"name": s["name"], "url": s["url"].rstrip("/"), "current": False}
+                for s in siblings
+            ]
+            for s in siblings:
+                if s.get("url", "").rstrip("/") == current_url.rstrip("/"):
+                    result[0]["name"] = s["name"]
+                    break
+            self.json(result)
+        except Exception:
+            self.json({"error": "internal error"}, 500)
+
+
+# ── protected endpoints ───────────────────────────────────────────────────────
+
+class StatusHandler(BaseAuthHandler):
+    async def get(self):
+        chips = await asyncio.to_thread(read_byobu_status)
+        self.json(chips)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket handler
+# ---------------------------------------------------------------------------
+
+_MAX_HISTORY_LINES = 10_000
+_TMUX_ID_RE = re.compile(r"^[$@%]\d+$")
+_WS_RATE_WINDOW = 1.0   # seconds
+_WS_RATE_LIMIT  = 20    # max messages per window
+
+# ---------------------------------------------------------------------------
+# tmux control mode: push wakes and forkless captures
+#
+# One `tmux -C attach-session` client per streamed session turns the pane
+# stream from polled into event-driven: tmux pushes an %output notification
+# the moment a pane produces bytes, which wakes the stream loop; read-only
+# commands (capture-pane, display-message) ride the same connection instead
+# of paying a fork+exec each. The client attaches with ignore-size so it
+# never influences window geometry. read-only is deliberately NOT set: tmux
+# resolves some commands through the attached client and a read-only one
+# makes external send-keys fail server-wide ("client is read-only", tmux
+# 3.7). Everything falls back to the subprocess path when the client is
+# missing or mid-respawn, so control mode is an accelerator, not a
+# dependency. Command replies over control mode are byte-identical to the
+# subprocess output, including raw ANSI from capture-pane -e (tmux 3.7).
+#
+# Control-mode commands are LINES that tmux itself parses, so values
+# interpolated into them must be injection-proof: the cm_* helpers accept
+# only _valid_tmux_id ids (falling back to the argv subprocess path
+# otherwise) and clamped ints. Anything user-typed (send-keys text) stays
+# on the argv path by design.
+# ---------------------------------------------------------------------------
+
+_CM_ATTACH_TIMEOUT = 3.0   # seconds to wait for the attach greeting block
+_CM_CMD_TIMEOUT = 5.0      # per-command reply timeout, matches _tmux's
+_CM_BACKOFF = 5.0          # seconds between attach attempts after a failure
+
+
+class _ControlClient:
+    """One control-mode tmux client attached to one session."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.proc: asyncio.subprocess.Process | None = None
+        self._pending: deque[asyncio.Future] = deque()
+        self._closing = False
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None \
+            and not self._closing
+
+    async def start(self) -> bool:
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                "tmux", "-C", "attach-session", "-t", self.session_id,
+                "-f", "ignore-size",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError:
+            return False
+        # The attach itself is answered with an empty %begin/%end block;
+        # consume it via a sentinel future so later replies pair with their
+        # commands in FIFO order.
+        greeting: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending.append(greeting)
+        asyncio.ensure_future(self._read_loop())
+        try:
+            await asyncio.wait_for(greeting, _CM_ATTACH_TIMEOUT)
+        except asyncio.TimeoutError:
+            self.stop()
+            return False
+        return self.alive
+
+    def stop(self) -> None:
+        self._closing = True
+        if self.proc is not None and self.proc.returncode is None:
+            try:
+                self.proc.terminate()
+            except ProcessLookupError:
+                pass
+
+    async def run(self, cmd: str) -> str | None:
+        """Run one tmux command; its output, or None on %error or a broken
+        connection -- both mean "no trustworthy result", so callers that
+        fall back to the subprocess path on None do so for either case
+        instead of mistaking a %error for a genuinely empty capture."""
+        if not self.alive:
+            return None
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending.append(fut)
+        try:
+            self.proc.stdin.write(cmd.encode() + b"\n")
+            await self.proc.stdin.drain()
+            return await asyncio.wait_for(fut, _CM_CMD_TIMEOUT)
+        except (OSError, asyncio.TimeoutError):
+            # A stuck or half-dead client could only pair replies out of
+            # sync; kill it and let the subprocess fallback take over.
+            self.stop()
+            return None
+
+    async def _read_loop(self) -> None:
+        block: list[bytes] | None = None
+        block_id: list[bytes] = []
+        try:
+            while True:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    break
+                if block is not None:
+                    if line.startswith((b"%end ", b"%error ")):
+                        # Match timestamp+number so captured content that
+                        # merely starts with "%end" cannot close the block.
+                        if line.split()[1:3] == block_id:
+                            # %error means the command itself failed (e.g. a
+                            # stale pane mapping) -- None, like a broken
+                            # connection, not "" which a genuinely empty
+                            # capture also produces and callers would then
+                            # be unable to tell apart from a real error.
+                            result = None if line.startswith(b"%error") else \
+                                b"".join(block).decode("utf-8", "replace")
+                            if self._pending:
+                                fut = self._pending.popleft()
+                                if not fut.done():
+                                    fut.set_result(result)
+                            block = None
+                            continue
+                    block.append(line)
+                elif line.startswith(b"%begin "):
+                    block_id = line.split()[1:3]
+                    block = []
+                elif line.startswith(b"%output "):
+                    pane_id = line.split(b" ", 2)[1].decode("ascii", "replace")
+                    _MONITOR.wake(pane_id)
+                # All other notifications are irrelevant to the stream.
+        except Exception:
+            pass
+        finally:
+            self.stop()
+            while self._pending:
+                fut = self._pending.popleft()
+                if not fut.done():
+                    fut.set_result(None)
+            _MONITOR.client_gone(self)
+
+
+class _TmuxMonitor:
+    """Registry of control clients and the pane watchers they wake."""
+
+    def __init__(self):
+        self._clients: dict[str, _ControlClient] = {}
+        self._watchers: dict[str, set[asyncio.Event]] = {}
+        self._pane_session: dict[str, str] = {}
+        self._backoff_until: dict[str, float] = {}
+        self._spawn_lock: asyncio.Lock | None = None
+
+    def wake(self, pane_id: str) -> None:
+        for event in self._watchers.get(pane_id, ()):
+            event.set()
+
+    def watch(self, pane_id: str, event: asyncio.Event) -> None:
+        self._watchers.setdefault(pane_id, set()).add(event)
+
+    def unwatch(self, pane_id: str, event: asyncio.Event) -> None:
+        events = self._watchers.get(pane_id)
+        if events:
+            events.discard(event)
+            if not events:
+                del self._watchers[pane_id]
+        if pane_id in self._watchers:
+            return
+        session_id = self._pane_session.pop(pane_id, None)
+        if session_id and session_id not in self._pane_session.values():
+            client = self._clients.pop(session_id, None)
+            if client:
+                client.stop()
+
+    async def ensure(self, pane_id: str) -> str | None:
+        """Session id whose control client covers pane_id, or None.
+
+        Cheap when the client is already up or in backoff; attaches one
+        otherwise. pane_id must already be validated (_valid_tmux_id).
+        """
+        session_id = self._pane_session.get(pane_id)
+        if session_id is None:
+            raw = await asyncio.to_thread(
+                _tmux, "display-message", "-p", "-t", pane_id, "#{session_id}")
+            session_id = raw.strip()
+            if not _valid_tmux_id(session_id):
+                return None
+            if pane_id in self._watchers:
+                self._pane_session[pane_id] = session_id
+        client = self._clients.get(session_id)
+        if client is not None and client.alive:
+            return session_id
+        if time.monotonic() < self._backoff_until.get(session_id, 0.0):
+            return None
+        if self._spawn_lock is None:
+            self._spawn_lock = asyncio.Lock()
+        async with self._spawn_lock:
+            client = self._clients.get(session_id)  # lost a spawn race?
+            if client is not None and client.alive:
+                return session_id
+            client = _ControlClient(session_id)
+            if await client.start():
+                self._clients[session_id] = client
+                return session_id
+        self._backoff_until[session_id] = time.monotonic() + _CM_BACKOFF
+        return None
+
+    async def run(self, session_id: str, cmd: str) -> str | None:
+        client = self._clients.get(session_id)
+        if client is None or not client.alive:
+            return None
+        return await client.run(cmd)
+
+    def client_gone(self, client: _ControlClient) -> None:
+        # Reached on any reader exit. Only an unsolicited death still owns
+        # its registry slot (a deliberate stop() was already popped by
+        # unwatch), and only that death earns an attach backoff.
+        if self._clients.get(client.session_id) is client:
+            del self._clients[client.session_id]
+            self._backoff_until[client.session_id] = \
+                time.monotonic() + _CM_BACKOFF
+
+
+_MONITOR = _TmuxMonitor()
+
+
+async def cm_capture_pane(session_id: str | None, pane_id: str,
+                          history_lines: int = 200, ansi: bool = False,
+                          join: bool = False) -> str:
+    """tmux_capture_pane over the control client, subprocess fallback."""
+    if session_id and _valid_tmux_id(pane_id):
+        cmd = f"capture-pane -t {pane_id} -p"
+        if ansi:
+            cmd += " -e"
+        if join:
+            cmd += " -J"
+        cmd += f" -S -{history_lines}"
+        raw = await _MONITOR.run(session_id, cmd)
+        if raw is not None:
+            return raw if ansi else strip_ansi(raw)
+    return await asyncio.to_thread(
+        tmux_capture_pane, pane_id, history_lines, ansi, join)
+
+
+async def cm_cursor(session_id: str | None, pane_id: str) -> dict | None:
+    """tmux_cursor over the control client, subprocess fallback."""
+    if session_id and _valid_tmux_id(pane_id):
+        raw = await _MONITOR.run(
+            session_id, f'display-message -p -t {pane_id} "{_CURSOR_FMT}"')
+        if raw is not None:
+            return _cursor_from_raw(raw)
+    return await asyncio.to_thread(tmux_cursor, pane_id)
+
+
+async def cm_join_cursor(session_id: str | None, pane_id: str,
+                         content: str) -> dict | None:
+    """Cursor for a joined (-J) capture, mapped by _join_cursor."""
+    raw = None
+    if session_id and _valid_tmux_id(pane_id):
+        raw = await _MONITOR.run(
+            session_id, f'display-message -p -t {pane_id} "{_CURSOR_FMT}"')
+    if raw is None:
+        raw = await asyncio.to_thread(_cursor_fields, pane_id)
+    fields = _parse_cursor_fields(raw)
+    if fields is None:
+        return None
+    x, y, height, width = fields
+    return _join_cursor(content, x, y, height, width)
+
+
+# Pane stream cadence. _POLL_IDLE is the background tick; while keystrokes
+# are flowing (a send_keys within the last _POLL_ACTIVE_WINDOW seconds) the
+# stream ticks at _POLL_ACTIVE instead. A send_keys for the subscribed pane
+# also wakes the stream immediately: the loop waits _KEYSTROKE_SETTLE before
+# capturing so the pty echo lands in the capture, and keystrokes arriving
+# inside one settle window are coalesced into a single capture.
+_POLL_IDLE = 0.5            # seconds between captures with no recent input
+_POLL_ACTIVE = 0.15         # seconds between captures while input flows
+_POLL_ACTIVE_WINDOW = 2.0   # seconds of fast cadence after a send_keys
+_KEYSTROKE_SETTLE = 0.03    # seconds between key injection and capture
+# With a control client pushing %output wakes, the tick is only a safety net
+# for anything a wake cannot carry (a lost notification, a dead client), so
+# it can be slow.
+_POLL_IDLE_MONITORED = 2.0
+
+def _valid_tmux_id(s: str) -> bool:
+    return bool(s and _TMUX_ID_RE.match(s))
+
+_TMUX_NAME_BAD = re.compile(r'[:.@%\n\r]')
+_BYOBU_METRIC_RE = re.compile(r'^[a-zA-Z0-9_]+$')
+
+def _valid_tmux_name(s: str) -> bool:
+    return bool(s) and not _TMUX_NAME_BAD.search(s)
+
+
+def _diff_line_ops(old: list[str], new: list[str]) -> list[dict]:
+    """Line-wise ops that turn old into new, for patch subscribers.
+
+    Each op carries indices into the old list ([start, end) half-open) in
+    ascending start order; the client applies them in reverse so earlier
+    indices stay valid without re-mapping. autojunk stays off: a capture
+    repeats blank lines far past the popularity heuristic's 1% threshold,
+    which would junk them and shred a clean scroll into replaces.
+    """
+    ops = []
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        op = {"op": tag, "start": i1, "end": i2}
+        if tag != "delete":
+            op["lines"] = new[j1:j2]
+        ops.append(op)
+    return ops
+
+
+class WsHandler(tornado.websocket.WebSocketHandler):
+    """One WebSocket connection per browser tab.
+
+    check_origin() requires Origin == Host, as a security measure against
+    cross-site WebSocket hijacking -- but against _external_host(), not
+    Tornado's default of the raw Host header. In serve mode's Unix-socket
+    proxying, Host is always "localhost" (see _external_host), which would
+    otherwise make Tornado's own default reject every real browser's upgrade
+    request as cross-origin.
+    """
+
+    def check_origin(self, origin: str) -> bool:
+        return urlparse(origin).netloc.lower() == _external_host(self.request).lower()
+
+    def get_compression_options(self):
+        # permessage-deflate was never turned on, so every snapshot/update/
+        # delta shipped as raw, uncompressed text -- pane captures are
+        # brutally repetitive (tmux pads every line out to the pane width
+        # with spaces; ANSI color runs repeat constantly), so this was
+        # leaving most of the payload on the table for free. Measured on
+        # real `tmux capture-pane -e` output: ~87-90% smaller after deflate.
+        # On a bandwidth-starved link (reported from airplane wifi) the
+        # daemon can only ever have one write in flight per connection
+        # (see _send_wait), and that write's bytes are already committed to
+        # the OS's send queue before a pane-switch can cancel anything --
+        # shrinking the payload by an order of magnitude directly shrinks
+        # the worst-case wait behind it. Browsers offer this extension by
+        # default; returning a dict (even empty, which keeps tornado's
+        # defaults) is the only thing needed server-side to accept it.
+        return {}
+
+    async def get(self, *args, **kwargs):
+        # Chrome uses HTTP/2 for HTTPS connections. HTTP/2 WebSocket (RFC 8441)
+        # uses CONNECT + :protocol:websocket and omits Sec-WebSocket-Key.
+        # Tailscale serve translates H2→H1.1 but doesn't generate the missing
+        # key, causing Tornado to reject the handshake with 400. Inject it here.
+        hdrs = self.request.headers
+        if not hdrs.get("Sec-WebSocket-Key"):
+            hdrs["Sec-WebSocket-Key"] = base64.b64encode(os.urandom(16)).decode()
+        if not hdrs.get("Upgrade"):
+            hdrs["Upgrade"] = "websocket"
+        if "upgrade" not in hdrs.get("Connection", "").lower():
+            hdrs["Connection"] = "Upgrade"
+        await super().get(*args, **kwargs)
+
+    def open(self):
+        # Nagle would hold a small frame (a keystroke, a one-line patch) for
+        # up to an RTT waiting on ACKs; interactive latency outranks the few
+        # bytes of header overhead.
+        self.set_nodelay(True)
+        self._stream_task: asyncio.Task | None = None
+        self._stream_pane_id: str | None = None
+        self._stream_wake = asyncio.Event()
+        self._last_input_mono = 0.0
+        self._topo_task: asyncio.Task | None = None
+        self._auth_timer: asyncio.Task | None = None
+        self._rate_window_start = time.monotonic()
+        self._rate_count = 0
+        token = self.get_cookie("trustmux_session") or ""
+        if token:
+            # Cookie present: accept if valid, reject immediately if not
+            if _valid_session_token(token):
+                self._token = token
+                self._authenticated = True
+                self._start_streams()
+            else:
+                self.close(4401, "unauthorized")
+        else:
+            # No cookie: native client authenticates via first-message auth frame
+            self._token = None
+            self._authenticated = False
+            self._auth_timer = asyncio.ensure_future(self._auth_timeout())
+
+    def _start_streams(self):
+        _ws_clients.setdefault(self._token, set()).add(self)
+        asyncio.ensure_future(self._send_sessions())
+        self._topo_task = asyncio.ensure_future(self._poll_topology())
+
+    async def _auth_timeout(self):
+        await asyncio.sleep(10)
+        if not getattr(self, "_authenticated", False):
+            self.close(4401, "authentication timeout")
+
+    def on_message(self, raw):
+        asyncio.ensure_future(self._handle(raw))
+
+    def on_close(self):
+        token = getattr(self, "_token", None)
+        if token and token in _ws_clients:
+            _ws_clients[token].discard(self)
+            if not _ws_clients[token]:
+                del _ws_clients[token]
+        if getattr(self, "_stream_task", None):
+            self._stream_task.cancel()
+        if getattr(self, "_topo_task", None):
+            self._topo_task.cancel()
+        if getattr(self, "_auth_timer", None):
+            self._auth_timer.cancel()
+
+    def _build_msg(self, obj: dict) -> str:
+        obj["server_ts"] = int(time.time() * 1000)
+        obj["server_tz"] = _SERVER_TZ
+        obj["server_tz_offset_s"] = int(datetime.now().astimezone().utcoffset().total_seconds())
+        obj["server_ip"] = _SERVER_IP
+        return json.dumps(obj)
+
+    def _send(self, obj: dict):
+        try:
+            self.write_message(self._build_msg(obj))
+        except tornado.websocket.WebSocketClosedError:
+            pass
+
+    async def _send_wait(self, obj: dict):
+        # Unlike _send, this awaits the write actually draining before
+        # returning. The three streaming loops below (topology poll, pane
+        # snapshot/update) each re-fetch and re-send full state on a fixed
+        # tick with no idea whether the client has caught up -- with a
+        # fire-and-forget _send, a client slower than the tick rate (a
+        # high-latency phone connection) never applies backpressure, so
+        # every tick's full repaint keeps queuing in the kernel socket
+        # buffer behind whatever hasn't drained yet. Measured on a real
+        # connection: this grew to 2.6MB of queued, already-stale pane
+        # updates, which a fresh pane-switch snapshot then had to wait
+        # behind -- explaining reports of context switches taking tens of
+        # seconds on slow links despite the daemon responding instantly.
+        # Awaiting here means a slow client simply pauses the loop instead
+        # of piling more full repaints behind an undelivered one, bounding
+        # the worst-case backlog to a single in-flight message.
+        try:
+            fut = self.write_message(self._build_msg(obj))
+            if fut is not None:
+                await fut
+        except (tornado.websocket.WebSocketClosedError, tornado.iostream.StreamClosedError):
+            pass
+
+    async def _send_sessions(self):
+        sessions = await asyncio.to_thread(tmux_list_sessions)
+        await self._send_wait({"type": "sessions", "data": sessions})
+
+    async def _poll_topology(self):
+        try:
+            sessions = await asyncio.to_thread(tmux_list_sessions)
+            last = json.dumps(sessions, sort_keys=True)
+        except Exception:
+            last = None
+        while True:
+            await asyncio.sleep(2)
+            try:
+                sessions = await asyncio.to_thread(tmux_list_sessions)
+                key = json.dumps(sessions, sort_keys=True)
+                if key != last:
+                    last = key
+                    await self._send_wait({"type": "sessions", "data": sessions})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    async def _stream_pane(self, pane_id: str, history_lines: int, ansi: bool = False,
+                           join: bool = False, patch: bool = False):
+        _MONITOR.watch(pane_id, self._stream_wake)
+        try:
+            # Cleared by the subscribe handler itself before this task was
+            # even scheduled (see _handle's "subscribe" branch), not here:
+            # clearing on this coroutine's first line would race a send_keys
+            # for this same pane arriving after the handler resolved
+            # self._stream_pane_id but before this task got its first turn,
+            # silently dropping that keystroke's fast-cadence wake.
+            session_id = await _MONITOR.ensure(pane_id)
+            content = await cm_capture_pane(session_id, pane_id, history_lines, ansi, join)
+            # Join (-J) merges soft-wrapped lines, so screen rows no longer
+            # map 1:1 to capture lines; cm_join_cursor re-maps the cursor
+            # into joined coordinates instead.
+            cursor = _clamp_cursor(
+                await (cm_join_cursor(session_id, pane_id, content) if join
+                       else cm_cursor(session_id, pane_id)), content)
+            msg = {"type": "snapshot", "pane_id": pane_id, "data": content}
+            if cursor:
+                msg.update(cursor)
+            await self._send_wait(msg)
+            last_content, last_cursor = content, cursor
+            # Line-wise state kept regardless of patch: patch subscribers
+            # diff against it with _diff_line_ops (general line ops); plain
+            # subscribers still get the cheaper pure-scroll drop/append
+            # optimization (_diff_pane_lines) instead of regressing to a
+            # full update every tick.
+            last_lines = content.split("\n")
+            last_capture_mono = time.monotonic()
+            while True:
+                session_id = await _MONITOR.ensure(pane_id)
+                if session_id:
+                    interval = _POLL_IDLE_MONITORED
+                elif time.monotonic() - self._last_input_mono < _POLL_ACTIVE_WINDOW:
+                    interval = _POLL_ACTIVE
+                else:
+                    interval = _POLL_IDLE
+                try:
+                    await asyncio.wait_for(self._stream_wake.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    # No clear() on this path: a wake racing the timeout must
+                    # survive to the next iteration, where its capture gets
+                    # the settle delay.
+                    pass
+                else:
+                    # Keystroke or %output wake: let the pty echo land before
+                    # capturing. Wakes arriving inside the settle are absorbed
+                    # by the clear(), so a burst produces one capture.
+                    await asyncio.sleep(_KEYSTROKE_SETTLE)
+                    self._stream_wake.clear()
+                if session_id:
+                    # %output can fire per byte (a running `yes` produces
+                    # thousands of wakes a second); floor the capture rate at
+                    # the old active cadence so a busy pane costs what it
+                    # always did. Wakes landing inside the floor sleep are
+                    # coalesced into this capture by the clear().
+                    floor = _POLL_ACTIVE - (time.monotonic() - last_capture_mono)
+                    if floor > 0:
+                        await asyncio.sleep(floor)
+                        self._stream_wake.clear()
+                content = await cm_capture_pane(session_id, pane_id, history_lines, ansi, join)
+                cursor = _clamp_cursor(
+                    await (cm_join_cursor(session_id, pane_id, content) if join
+                           else cm_cursor(session_id, pane_id)), content)
+                last_capture_mono = time.monotonic()
+                if content != last_content:
+                    new_lines = content.split("\n")
+                    if patch:
+                        ops = _diff_line_ops(last_lines, new_lines)
+                        # A diff at least as large as the content buys
+                        # nothing; fall back to a full update, which also
+                        # resyncs a client that lost its line state. Both
+                        # sides go through json.dumps with default
+                        # ensure_ascii, matching how _send encodes them on
+                        # the wire, so \uXXXX escaping of non-ASCII (box
+                        # drawing) inflates ops and content alike instead of
+                        # biasing such panes toward full updates.
+                        if len(json.dumps(ops)) < len(json.dumps(content)):
+                            msg = {"type": "patch", "pane_id": pane_id, "ops": ops}
+                        else:
+                            msg = {"type": "update", "pane_id": pane_id, "data": content}
+                    else:
+                        # Non-patch subscribers (join/wrap mode, or an older
+                        # client that never sends "patch") still get the
+                        # cheaper pure-scroll optimization instead of a full
+                        # update every tick.
+                        diff = _diff_pane_lines(last_lines, new_lines)
+                        if diff is not None:
+                            drop, appended = diff
+                            # A pure top-drop/bottom-append -- the common case
+                            # for a scrolling pane -- costs only the new
+                            # lines instead of the whole captured window.
+                            msg = {
+                                "type": "delta", "pane_id": pane_id,
+                                "drop": drop, "append": appended,
+                            }
+                        else:
+                            msg = {"type": "update", "pane_id": pane_id, "data": content}
+                    last_lines = new_lines
+                    if cursor:
+                        msg.update(cursor)
+                    await self._send_wait(msg)
+                elif cursor != last_cursor:
+                    # Bare cursor move (vi h/j/k/l): the content is unchanged,
+                    # so a full update would make the client re-render (and
+                    # destroy any in-progress text selection) for nothing.
+                    # A data-less cursor message moves the ghost anchor alone;
+                    # fields absent means the cursor became unreadable and the
+                    # client falls back to its end-of-buffer anchor.
+                    msg = {"type": "cursor", "pane_id": pane_id}
+                    if cursor:
+                        msg.update(cursor)
+                    await self._send_wait(msg)
+                last_content, last_cursor = content, cursor
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._send({"type": "error", "message": "pane stream error"})
+        finally:
+            _MONITOR.unwatch(pane_id, self._stream_wake)
+
+    async def _handle(self, raw: str):
+        # Handle unauthenticated state — expect auth message first
+        if not getattr(self, "_authenticated", False):
+            try:
+                msg = json.loads(raw)
+                if isinstance(msg, dict) and msg.get("type") == "auth":
+                    token = str(msg.get("token", ""))
+                    if _valid_session_token(token):
+                        if self._auth_timer:
+                            self._auth_timer.cancel()
+                            self._auth_timer = None
+                        self._token = token
+                        self._authenticated = True
+                        self._start_streams()
+                        return
+            except Exception:
+                pass
+            self.close(4401, "unauthorized")
+            return
+
+        # Re-check token on every message — catches revocation mid-session
+        if not _valid_session_token(getattr(self, "_token", "")):
+            self.close(4401, "unauthorized")
+            return
+
+        # Rate limiting: fixed window, per connection
+        now = time.monotonic()
+        if now - self._rate_window_start >= _WS_RATE_WINDOW:
+            self._rate_window_start = now
+            self._rate_count = 0
+        self._rate_count += 1
+        if self._rate_count > _WS_RATE_LIMIT:
+            self._send({"type": "error", "message": "rate limit exceeded"})
+            return
+
+        if len(raw) > 16_384:
+            self._send({"type": "error", "message": "message too large"})
+            return
+
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            self._send({"type": "error", "message": "invalid JSON"})
+            return
+        finally:
+            del raw  # drop the raw WebSocket frame as early as possible
+        if not isinstance(msg, dict):
+            self._send({"type": "error", "message": "invalid JSON"})
+            return
+
+        mtype = msg.get("type")
+
+        try:
+            if mtype == "ping":
+                # Round-trip latency probe for the connection-info popup —
+                # deliberately does no work beyond echoing back, unlike
+                # list_sessions which queries tmux.
+                self._send({"type": "pong"})
+
+            elif mtype == "list_sessions":
+                sessions = await asyncio.to_thread(tmux_list_sessions)
+                self._send({"type": "sessions", "data": sessions})
+
+            elif mtype == "subscribe":
+                pane_id = msg.get("pane_id", "")
+                if not _valid_tmux_id(pane_id):
+                    self._send({"type": "error", "message": "invalid pane_id"})
+                else:
+                    try:
+                        lines = max(1, min(int(msg.get("lines", 300)), _MAX_HISTORY_LINES))
+                    except (ValueError, TypeError):
+                        lines = 300
+                    ansi = bool(msg.get("ansi", False))
+                    join = bool(msg.get("join", False))
+                    # Opt-in like join was: clients that never send it keep
+                    # getting full updates, byte-identical to before.
+                    patch = bool(msg.get("patch", False))
+                    if self._stream_task:
+                        self._stream_task.cancel()
+                        await asyncio.gather(self._stream_task, return_exceptions=True)
+                    self._stream_pane_id = pane_id
+                    # Clear synchronously, here, rather than as the new
+                    # _stream_pane task's first line: a send_keys for this
+                    # pane can otherwise arrive and set() the event in the
+                    # gap between this handler resolving and that task
+                    # actually getting its first turn, and a clear() on that
+                    # first turn would wipe out a wake that was never stale.
+                    self._stream_wake.clear()
+                    self._stream_task = asyncio.ensure_future(
+                        self._stream_pane(pane_id, lines, ansi, join, patch)
+                    )
+
+            elif mtype == "new_session":
+                name = str(msg.get("name", "")).strip()[:128]
+                if not name:
+                    self._send({"type": "error", "message": "session name required"})
+                elif not _valid_tmux_name(name):
+                    self._send({"type": "error", "message": "invalid session name"})
+                else:
+                    await asyncio.to_thread(tmux_new_session, name)
+                    sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                    new_id = next((s["id"] for s in sessions_list if s["name"] == name), None)
+                    self._send({"type": "sessions", "data": sessions_list, "new_session": new_id})
+
+            elif mtype == "new_window":
+                sid = msg.get("session_id", "")
+                if not _valid_tmux_id(sid):
+                    self._send({"type": "error", "message": "invalid session_id"})
+                else:
+                    name = str(msg.get("name", "")).strip()[:128]
+                    if name and not _valid_tmux_name(name):
+                        self._send({"type": "error", "message": "invalid window name"})
+                        return
+                    await asyncio.to_thread(tmux_new_window, sid, name)
+                    sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                    # Find the newly created pane: last window (highest index) in this session
+                    new_pane_id = None
+                    for s in sessions_list:
+                        if s["id"] == sid and s.get("windows"):
+                            last_win = max(s["windows"], key=lambda w: w["index"])
+                            if last_win.get("panes"):
+                                new_pane_id = last_win["panes"][0]["id"]
+                            break
+                    self._send({"type": "sessions", "data": sessions_list, "new_pane": new_pane_id})
+
+            elif mtype == "new_pane":
+                wid = msg.get("window_id", "")
+                if not _valid_tmux_id(wid):
+                    self._send({"type": "error", "message": "invalid window_id"})
+                else:
+                    # Snapshot pane IDs before split to identify the new one
+                    panes_before = {p["id"] for p in await asyncio.to_thread(tmux_list_panes, wid)}
+                    await asyncio.to_thread(tmux_new_pane, wid)
+                    sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                    new_pane_id = None
+                    for s in sessions_list:
+                        for w in s.get("windows", []):
+                            if w["id"] == wid:
+                                for p in w.get("panes", []):
+                                    if p["id"] not in panes_before:
+                                        new_pane_id = p["id"]
+                                break
+                    self._send({"type": "sessions", "data": sessions_list, "new_pane": new_pane_id})
+
+            elif mtype == "kill_pane":
+                pane_id = msg.get("pane_id", "")
+                if not _valid_tmux_id(pane_id):
+                    self._send({"type": "error", "message": "invalid pane_id"})
+                else:
+                    await asyncio.to_thread(tmux_kill_pane, pane_id)
+                    sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                    self._send({"type": "sessions", "data": sessions_list})
+
+            elif mtype == "kill_window":
+                wid = msg.get("window_id", "")
+                if not _valid_tmux_id(wid):
+                    self._send({"type": "error", "message": "invalid window_id"})
+                else:
+                    await asyncio.to_thread(tmux_kill_window, wid)
+                    sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                    self._send({"type": "sessions", "data": sessions_list})
+
+            elif mtype == "kill_session":
+                sid = msg.get("session_id", "")
+                if not _valid_tmux_id(sid):
+                    self._send({"type": "error", "message": "invalid session_id"})
+                else:
+                    await asyncio.to_thread(tmux_kill_session, sid)
+                    sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                    self._send({"type": "sessions", "data": sessions_list})
+
+            elif mtype == "send_keys":
+                # req_id is an opaque client-chosen token, only ever echoed
+                # back verbatim -- it exists so the PWA can correlate an ack
+                # (or this error) with the specific send that triggered it,
+                # e.g. to know a long typed prompt actually reached the
+                # daemon before clearing it from the input box, particularly
+                # over a high-latency/flaky link where "no reply yet" and
+                # "never arrived" are otherwise indistinguishable. Only sent
+                # back at all if the caller included one -- every other
+                # send_keys call site (key bar taps, Esc/Ctrl-C) doesn't
+                # want an ack for every keystroke.
+                req_id = msg.get("req_id")
+                req_id = str(req_id)[:64] if req_id is not None else None
+                pane_id = msg.get("pane_id", "")
+                if not _valid_tmux_id(pane_id):
+                    err = {"type": "error", "message": "invalid pane_id"}
+                    if req_id is not None:
+                        err["req_id"] = req_id
+                    self._send(err)
+                else:
+                    keys = str(msg.get("keys", ""))[:4096]
+                    enter   = bool(msg.get("enter", True))
+                    literal = bool(msg.get("literal", True))
+                    await asyncio.to_thread(tmux_send_keys, pane_id, keys, enter, literal)
+                    del keys  # release sensitive content as early as possible
+                    if pane_id == self._stream_pane_id:
+                        # Wake the pane stream for an immediate capture and
+                        # start the fast-cadence window.
+                        self._last_input_mono = time.monotonic()
+                        self._stream_wake.set()
+                    if req_id is not None:
+                        self._send({"type": "send_keys_ack", "req_id": req_id})
+
+            elif mtype == "rename_window":
+                wid = msg.get("window_id", "")
+                if not _valid_tmux_id(wid):
+                    self._send({"type": "error", "message": "invalid window_id"})
+                else:
+                    name = str(msg.get("name", "")).strip()[:128]
+                    if not name or not _valid_tmux_name(name):
+                        self._send({"type": "error", "message": "invalid window name"})
+                    else:
+                        await asyncio.to_thread(tmux_rename_window, wid, name)
+                        sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                        self._send({"type": "sessions", "data": sessions_list})
+
+            elif mtype == "rename_session":
+                sid = msg.get("session_id", "")
+                if not _valid_tmux_id(sid):
+                    self._send({"type": "error", "message": "invalid session_id"})
+                else:
+                    name = str(msg.get("name", "")).strip()[:128]
+                    if not name or not _valid_tmux_name(name):
+                        self._send({"type": "error", "message": "invalid session name"})
+                    else:
+                        await asyncio.to_thread(tmux_rename_session, sid, name)
+                        sessions_list = await asyncio.to_thread(tmux_list_sessions)
+                        self._send({"type": "sessions", "data": sessions_list})
+
+        except Exception:
+            err = {"type": "error", "message": "command failed"}
+            # Echo req_id here too (not just the pane_id-validation error
+            # above) -- an unexpected failure partway through is exactly
+            # when a correlatable reply matters most, e.g. so the PWA can
+            # tell a send_keys it's tracking as pending genuinely failed
+            # rather than just never getting an answer.
+            req_id = msg.get("req_id") if isinstance(msg, dict) else None
+            if req_id is not None:
+                err["req_id"] = str(req_id)[:64]
+            self._send(err)
+
+
+# ---------------------------------------------------------------------------
+# Admin Unix socket — trustmux-pair / trustmux-unpair only
+# Socket is 0o600; only the owning user can connect.
+# No TCP exposure: management traffic never touches the network.
+# ---------------------------------------------------------------------------
+
+async def _handle_admin(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        raw = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=5.0)
+        cmd = json.loads(raw)
+    except Exception:
+        writer.write(b'{"error":"bad request"}\n')
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    if not isinstance(cmd, dict):
+        writer.write(b'{"error":"bad request"}\n')
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    try:
+        action = cmd.get("action", "")
+
+        if action == "info":
+            # Lets `trustmux stop/status/pair` discover the live listener
+            # instead of assuming the default port.
+            resp: object = {
+                "pid":       os.getpid(),
+                "host":      _listen.get("host", ""),
+                "port":      _listen.get("port", 0),
+                "scheme":    _listen.get("scheme", ""),
+                "advertise": _listen.get("advertise", []),
+                "fingerprint": _cert_fingerprint,
+                "unix":      _listen.get("unix", ""),
+            }
+
+        elif action == "pair_generate":
+            code = _generate_pair_code()
+            _print_pair_code()
+            resp = {"code": f"{code[:3]}-{code[3:]}", "expires_in": _PAIR_CODE_TTL}
+
+        elif action == "pair_status":
+            # Outcome of the most recent code, so `trustmux pair` can stop waiting.
+            # Never returns the code itself or a session token.
+            if _pair_paired_ip:
+                resp = {"state": "paired", "ip": _pair_paired_ip}
+            elif _pair_code and time.monotonic() < _pair_code_mono_expiry:
+                resp = {"state": "pending",
+                        "expires_in": int(_pair_code_mono_expiry - time.monotonic())}
+            else:
+                resp = {"state": "expired"}
+
+        elif action == "sessions_list":
+            resp = [
+                {
+                    "token":      t[:8] + "…",
+                    "token_full": t,
+                    "ip":         s["ip"],
+                    "paired_at":  datetime.fromtimestamp(float(s["paired_at"])).strftime("%Y-%m-%d %H:%M:%S"),
+                    "label":      s.get("label", ""),
+                }
+                for t, s in _sessions.items()
+            ]
+
+        elif action == "sessions_delete":
+            token = cmd.get("token")   # None = clear all; non-empty string = specific token
+            if token is None:
+                tokens_to_evict = list(_sessions.keys())
+                count = len(_sessions)
+                _sessions.clear()
+                _save_tokens()
+                for t in tokens_to_evict:
+                    for ws in list(_ws_clients.get(t, [])):
+                        ws.close(4401, "unauthorized")
+                resp = {"ok": True, "removed": count}
+            elif token:
+                if token in _sessions:
+                    del _sessions[token]
+                    _save_tokens()
+                    for ws in list(_ws_clients.get(token, [])):
+                        ws.close(4401, "unauthorized")
+                    resp = {"ok": True}
+                else:
+                    resp = {"error": "session not found"}
+            else:
+                resp = {"error": "token must be null (clear all) or a non-empty string"}
+
+        else:
+            resp = {"error": f"unknown action: {action!r}"}
+
+        writer.write(json.dumps(resp).encode() + b"\n")
+    except Exception:
+        writer.write(b'{"error":"internal error"}\n')
+    finally:
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+
+def _socket_is_stale(path: Path) -> bool:
+    """True if path is a socket file with nothing listening on it.
+
+    Shares socket_is_live() with the CLI so that "is this instance running?"
+    cannot be answered one way here and another way by `trustmux status`.
+    """
+    return not socket_is_live(path)
+
+
+async def _run_admin_server() -> None:
+    # ensure_dirs(), not a bare mkdir: it re-asserts 0700 on a directory that
+    # already exists with looser permissions, which is what guards the socket.
+    INSTANCE.ensure_dirs()
+    # Only ever remove a socket nothing is serving; main() has already refused
+    # to start if a live one was there.
+    if ADMIN_SOCK.exists() and _socket_is_stale(ADMIN_SOCK):
+        ADMIN_SOCK.unlink()
+    old_mask = os.umask(0o177)  # socket created with mode 0o600
+    try:
+        server = await asyncio.start_unix_server(_handle_admin, path=str(ADMIN_SOCK))
+    finally:
+        os.umask(old_mask)
+    ADMIN_SOCK.chmod(0o600)  # belt and suspenders
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        ADMIN_SOCK.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Application wiring
+# ---------------------------------------------------------------------------
+
+def _make_app() -> tornado.web.Application:
+    return tornado.web.Application([
+        (r"/",               IndexHandler),
+        (r"/trustmux\.svg",  SvgHandler),
+        (r"/manifest\.json", ManifestHandler),
+        (r"/sw\.js",         ServiceWorkerHandler),
+        (r"/app\.js",        AppJsHandler),
+        (r"/icons/(.+)",     IconHandler),
+        (r"/fonts/(.+)",     FontHandler),
+        (r"/ping",           PingHandler),
+        (r"/pair",           PairHandler),
+        (r"/machines",       MachinesHandler),
+        (r"/status",         StatusHandler),
+        (r"/ws",             WsHandler),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+_cert_fingerprint: str = ""   # SHA-256 of the served certificate, for `status`
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Create path with mode 0600 from the first byte; never chmod-after."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, path)
+
+
+def _ensure_self_signed_cert(lan_ip: str, advertised: Sequence[str] = ()) -> tuple:
+    """Return (cert_path, ssl_ctx) for a self-signed cert covering lan_ip.
+
+    advertised are hosts this daemon was told to publish.  They have to be in
+    here: a browser refuses a certificate that omits the name in the URL bar
+    outright, rather than offering the click-through a self-signed one gets, so
+    advertising an address without certifying it would be worse than useless.
+
+    The keypair is kept across restarts.  A certificate that changed on every
+    start would train the user to click through a fresh warning each time, and
+    a man in the middle presenting his own certificate would then look exactly
+    like a restart.  Keeping it lets a browser's "accept this certificate"
+    exception stick, and lets `trustmux status` print a fingerprint the user
+    can compare.  Only the certificate is reissued when the names it must
+    cover change; the key is reused so the fingerprint of the key does not.
+    """
+    import ssl as _ssl
+    import ipaddress as _ipaddress
+    import datetime as _datetime
+    from cryptography import x509 as _x509
+    from cryptography.x509.oid import NameOID as _NameOID
+    from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+    global _cert_fingerprint
+    cert = CERT_FILE
+    key  = KEY_FILE
+    # Re-assert 0700 rather than trust a pre-existing directory's mode: the
+    # private key is about to be written into it.
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o700)
+    san_parts = [f"IP:{lan_ip}", "IP:127.0.0.1", "DNS:localhost"]
+    fqdn = socket.getfqdn()
+    if fqdn and fqdn not in ("localhost", lan_ip):
+        san_parts.append(f"DNS:{fqdn}")
+    hostname = socket.gethostname().split(".")[0]
+    if hostname and hostname not in ("localhost",):
+        san_parts.append(f"DNS:{hostname}")
+    ts_ip = _tailscale_ip()
+    if ts_ip and ts_ip != lan_ip:
+        san_parts.append(f"IP:{ts_ip}")
+    for host in advertised:
+        try:
+            _ipaddress.ip_address(host)
+        except ValueError:
+            san_parts.append(f"DNS:{host}")
+        else:
+            san_parts.append(f"IP:{host}")
+    # An advertised host is often one of these already (the fqdn, say), and a
+    # duplicated SAN is legal but pointless.
+    san_parts = list(dict.fromkeys(san_parts))
+    now = _datetime.datetime.now(_datetime.timezone.utc)
+
+    def _fingerprint(c) -> str:
+        return c.fingerprint(_hashes.SHA256()).hex(":").upper()
+
+    def _ctx():
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_3
+        ctx.load_cert_chain(str(cert), str(key))
+        return ctx
+
+    private_key = None
+    if key.exists() and cert.exists():
+        try:
+            private_key = _ser.load_pem_private_key(key.read_bytes(), password=None)
+            existing = _x509.load_pem_x509_certificate(cert.read_bytes())
+            san = existing.extensions.get_extension_for_class(
+                _x509.SubjectAlternativeName).value
+            have = ({f"DNS:{n}" for n in san.get_values_for_type(_x509.DNSName)}
+                    | {f"IP:{ip}" for ip in san.get_values_for_type(_x509.IPAddress)})
+            not_after = getattr(existing, "not_valid_after_utc", None) \
+                or existing.not_valid_after.replace(tzinfo=_datetime.timezone.utc)
+            same_key = (existing.public_key().public_bytes(
+                            _ser.Encoding.DER, _ser.PublicFormat.SubjectPublicKeyInfo)
+                        == private_key.public_key().public_bytes(
+                            _ser.Encoding.DER, _ser.PublicFormat.SubjectPublicKeyInfo))
+            if (same_key and set(san_parts) <= have
+                    and not_after > now + _datetime.timedelta(days=30)):
+                _cert_fingerprint = _fingerprint(existing)
+                # The key may predate _write_private; make sure of its mode.
+                key.chmod(0o600)
+                print(f"Trustmux: reusing TLS certificate {cert} "
+                      f"(SHA-256 {_cert_fingerprint})", flush=True)
+                return cert, _ctx()
+            print("Trustmux: TLS certificate no longer covers every name; "
+                  "reissuing with the same key", flush=True)
+        except Exception as e:
+            print(f"Trustmux: cannot reuse existing TLS keypair ({e}); "
+                  "generating a new one", flush=True)
+            private_key = None
+
+    try:
+        if private_key is None:
+            private_key = _ec.generate_private_key(_ec.SECP256R1())
+        san_list = []
+        for part in san_parts:
+            if part.startswith("IP:"):
+                san_list.append(_x509.IPAddress(_ipaddress.ip_address(part[3:])))
+            elif part.startswith("DNS:"):
+                san_list.append(_x509.DNSName(part[4:]))
+        subject = issuer = _x509.Name([
+            _x509.NameAttribute(_NameOID.COMMON_NAME, "trustmux"),
+        ])
+        cert_obj = (
+            _x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(private_key.public_key())
+            .serial_number(_x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + _datetime.timedelta(days=3650))
+            .add_extension(_x509.SubjectAlternativeName(san_list), critical=False)
+            .sign(private_key, _hashes.SHA256())
+        )
+        _write_private(key, private_key.private_bytes(
+            encoding=_ser.Encoding.PEM,
+            format=_ser.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=_ser.NoEncryption(),
+        ))
+        cert.write_bytes(cert_obj.public_bytes(_ser.Encoding.PEM))
+        cert.chmod(0o644)
+        _cert_fingerprint = _fingerprint(cert_obj)
+    except Exception as e:
+        print(f"Error: TLS cert generation failed ({e})", flush=True)
+        print(f"Trustmux refuses to start without encryption. Install 'cryptography': {sys.executable} -m pip install --upgrade cryptography", flush=True)
+        sys.exit(1)
+    named = ", ".join(dict.fromkeys([lan_ip, *advertised]))
+    print(f"Trustmux: self-signed TLS cert generated for {named} "
+          f"(SHA-256 {_cert_fingerprint})", flush=True)
+    return cert, _ctx()
+
+
+async def _amain(host: str, port: int, https: bool, ssl_ctx=None,
+                 advertise: Sequence[str] = (), unix: str = "") -> None:
+    global _https_mode, _trust_forwarded_host, _listen
+    _https_mode = https or ssl_ctx is not None
+    _trust_forwarded_host = https
+    _listen = {
+        "host":   host if not unix else "",
+        # In Unix-socket mode the port is nominal: nothing is bound to it, but
+        # the CLI still identifies this daemon by it (pid file, `stop --port`).
+        "port":   port,
+        "unix":   unix,
+        # --https means tailscale serve terminates TLS in front of us, so the
+        # URL a client uses is https even though this socket is plain HTTP.
+        "scheme": "https" if _https_mode else "http",
+        # What pair and status should print.  Only the daemon knows which hosts
+        # its certificate actually attests, so it is the one to say.
+        "advertise": list(advertise),
+    }
+    app = _make_app()
+    # xheaders=True: trust X-Forwarded-For/Proto from tailscale serve proxy.
+    # Only set in --https mode; in direct mode leave False to prevent spoofing.
+    server = tornado.httpserver.HTTPServer(app, xheaders=https,
+                                           ssl_options=ssl_ctx,
+                                           max_body_size=65536)
+    if unix:
+        # tailscale serve connects to this as root, so 0600 inside the 0700
+        # state directory keeps every other local user out -- there is no
+        # loopback port for anyone to bind while we are down.
+        INSTANCE.ensure_dirs()
+        server.add_socket(tornado.netutil.bind_unix_socket(unix, mode=0o600))
+    else:
+        server.listen(port, address=host)
+    admin_task = asyncio.create_task(_run_admin_server())
+    try:
+        await asyncio.Event().wait()   # run until cancelled (Ctrl-C / SIGTERM)
+    finally:
+        admin_task.cancel()
+        try:
+            await admin_task
+        except asyncio.CancelledError:
+            pass
+        server.stop()
+        if unix:
+            Path(unix).unlink(missing_ok=True)
+
+
+def main():
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError
+    try:
+        _version = _pkg_version("trustmux")
+    except PackageNotFoundError:
+        _version = "dev"
+
+    parser = argparse.ArgumentParser(description="Trustmux daemon")
+    parser.add_argument("--version", action="version", version=f"trustmux {_version}")
+    parser.add_argument("--host", default=None,
+                        help="Bind address (default: Tailscale IP; 127.0.0.1 with --https)")
+    parser.add_argument("--port", type=int, default=7432,
+                        help="Port (default: 7432)")
+    parser.add_argument("--https", action="store_true",
+                        help="HTTPS mode: Secure cookie + trust proxy headers (use with tailscale serve)")
+    parser.add_argument("--unix", metavar="PATH", default="",
+                        help="Listen on this Unix socket instead of a TCP port "
+                             "(for `tailscale serve unix:PATH`); --port then only "
+                             "names the daemon")
+    parser.add_argument("--self-signed", action="store_true",
+                        help="Generate a self-signed TLS cert for direct HTTPS without Tailscale")
+    parser.add_argument("--name", metavar="NAME", default=None,
+                        help="Instance whose state and runtime files to use "
+                             "(default: default)")
+    parser.add_argument("--advertise", metavar="SOURCE", action="append",
+                        help="Address to publish and to name in the TLS "
+                             "certificate: HOST, HOST:PORT, a URL, or "
+                             "cmd:PROGRAM to run PROGRAM for it (repeatable)")
+    parser.add_argument("--no-advertise", action="store_true",
+                        help="Advertise nothing, ignoring any configured source")
+
+    # `trustmuxd help` is a natural guess (matches `trustmux help`'s alias for
+    # -h/--help) but argparse has no subcommands here to hang a hidden alias
+    # off of -- it would otherwise hit "unrecognized arguments: help" instead
+    # of the actual help text. Intercept it before parsing.
+    if len(sys.argv) > 1 and sys.argv[1] == "help":
+        parser.print_help()
+        sys.exit(0)
+    args = parser.parse_args()
+
+    # The CLI refuses root (trustmux._ctl._refuse_root) but the daemon can be
+    # started by hand.  As root it would create root-owned state under /root,
+    # run tmux commands against root's server, and hold a TLS key and session
+    # tokens that the user's own `trustmux` can neither see nor revoke.
+    if os.geteuid() == 0 and not os.environ.get("TRUSTMUX_ALLOW_ROOT"):
+        print("Error: trustmuxd must not run as root; start it as the user whose "
+              "tmux sessions it should serve.", file=sys.stderr)
+        print("  (set TRUSTMUX_ALLOW_ROOT=1 to override, e.g. in a container "
+              "that only has root)", file=sys.stderr)
+        sys.exit(1)
+
+    migrate_legacy_layout()
+    inst = resolve_instance(args.name)
+    if not check_sock_path(inst):
+        sys.exit(1)
+    _set_instance(inst)
+
+    # Refuse before the event loop starts, so this surfaces as a plain message
+    # rather than a traceback out of an asyncio task.  Unlinking a live socket
+    # would leave the daemon already serving on it running on an unlinked
+    # inode that nothing can reach, silently stealing pair/unpair/info from it.
+    if ADMIN_SOCK.exists() and not _socket_is_stale(ADMIN_SOCK):
+        print(f"Error: another trustmux daemon is already serving {ADMIN_SOCK}",
+              file=sys.stderr)
+        print("  Stop it first, or use a different state directory.", file=sys.stderr)
+        sys.exit(1)
+
+    _load_tokens()
+
+    host = args.host
+    if args.unix:
+        host = ""
+    elif not host:
+        if args.https:
+            host = "127.0.0.1"
+            print("Trustmux: HTTPS mode — binding to localhost (tailscale serve proxy)")
+        else:
+            host = _tailscale_ip()
+            if host:
+                print(f"Trustmux: binding to Tailscale IP {host}")
+            else:
+                host = "127.0.0.1"
+                print("Trustmux: Tailscale not found, binding to localhost only")
+
+    scheme = "https" if (args.https or args.self_signed) else "http"
+
+    # Ahead of the certificate, which has to name these hosts, and ahead of the
+    # admin socket, so a source that cannot be resolved keeps the daemon from
+    # ever answering with an address it has not confirmed.  Refusing to start is
+    # the same stance taken when TLS is unavailable: an unreachable URL or a
+    # certificate for the wrong host is not something a warning would fix.
+    try:
+        advertised = resolve(resolve_sources(args.advertise, args.no_advertise, inst),
+                             scheme, args.port)
+    except AdvertiseError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print("Trustmux refuses to start rather than publish an address it "
+              "cannot confirm.", file=sys.stderr)
+        sys.exit(1)
+    if advertised:
+        print("Trustmux: advertising " + ", ".join(a.url for a in advertised), flush=True)
+
+    ssl_ctx = None
+    if args.self_signed:
+        lan_ip = host if host not in ("0.0.0.0", None) else _tailscale_ip() or "127.0.0.1"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+        _, ssl_ctx = _ensure_self_signed_cert(lan_ip, [a.host for a in advertised])
+
+    where = f"unix:{args.unix}" if args.unix else f"{scheme}://{host}:{args.port}"
+    print(f"Trustmux daemon on {where} — run 'trustmux-pair' to pair a device.", flush=True)
+    asyncio.run(_amain(host, args.port, args.https, ssl_ctx,
+                       [a.url for a in advertised], unix=args.unix))
+
+
+if __name__ == "__main__":
+    main()

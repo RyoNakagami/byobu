@@ -1,6 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 #
 #    shutil: some shared utilities used by all status scripts
+#    Note: Uses decimal sleep (0.02) which requires bash
 #
 #    Copyright (C) 2011-2023 Dustin Kirkland
 #
@@ -107,6 +108,29 @@ color_tmux() {
 				color_map "$3"; fore="$_RET"
 			fi
 			[ "$MONOCHROME" = "1" ] && printf "#[default]" || printf "#[default]#[fg=$fore$attr,bg=$back]"
+		;;
+	esac
+}
+
+# Print $1 as literal text in the status line.  tmux treats "#" as the start
+# of a format -- #(command), #{variable}, #[style] -- and re-expands the output
+# of the #(byobu-status) job that produces the whole status line, so a "#"
+# that arrived as data (a hostname, /etc/os-release, an SSID) would be
+# interpreted rather than shown, and could name tmux variables to display or
+# restyle the bar.  Doubling it makes it literal.  screen prints "#" as is.
+printf_status() {
+	local s="$1" head=
+	case "$BYOBU_BACKEND" in
+		tmux)
+			while [ -n "$s" ]; do
+				head="${s%%#*}"
+				printf "%s" "$head"
+				s="${s#"$head"}"
+				[ -n "$s" ] && printf "##" && s="${s#\#}"
+			done
+		;;
+		*)
+			printf "%s" "$s"
 		;;
 	esac
 }
@@ -219,6 +243,7 @@ metadata_available() {
 		if [ -e /etc/ec2_version ] || [ -e /usr/sbin/update-grub-legacy-ec2 ]; then
 			# This *looks* like a machine with metadata, so background a potentially slow check
 			timeout 1 wget -q -O- --tries=1 http://169.254.169.254 </dev/null >"$cache" 2>/dev/null &
+			# Brief sleep for cold-start metadata detection (requires bash)
 			sleep 0.02
 			[ -s "$cache" ] && x=1
 		fi
@@ -241,6 +266,7 @@ status_freq() {
 		color)		_RET=9999991 ;;
 		cpu_count)	_RET=5 ;;
 		cpu_freq)	_RET=2 ;;
+		cpu_usage)	_RET=2 ;;
 		cpu_temp)	_RET=19 ;;
 		custom)		_RET=5 ;;
 		date)		_RET=9999991 ;;
@@ -264,7 +290,12 @@ status_freq() {
 		reboot_required) _RET=5 ;;
 		release)	_RET=599 ;;
 		services)	_RET=53 ;;
-		session)	_RET=9999991 ;;
+		# Not 9999991: unlike arch/distro/logo/etc., the session count
+		# genuinely changes at runtime as sessions open/close, and
+		# checking it (tmux list-sessions / screen -ls) is cheap. The
+		# long TTL left a stale multi-session indicator on screen for
+		# up to ~115 days after closing back down to one. GH #158
+		session)	_RET=5 ;;
 		swap)		_RET=19 ;;
 		time)		_RET=9999991 ;;
 		time_binary)	_RET=23 ;;
@@ -285,6 +316,16 @@ get_now() {
 		local s c
 		read s c < /proc/uptime
 		_RET=${s%.*}
+	elif [ "$BYOBU_OSTYPE" = "OpenBSD" ]; then
+		# Cache kern.boottime since it is constant
+		if [ -z "$_BYOBU_BOOTTIME" ]; then
+			_BYOBU_BOOTTIME=$(sysctl -n kern.boottime 2>/dev/null)
+		fi
+		if [ -n "$_BYOBU_BOOTTIME" ]; then
+			_RET=$(( $(date +%s) - _BYOBU_BOOTTIME ))
+		else
+			_RET=$(date +%s)
+		fi
 	else
 		_RET=$(date +%s);
 	fi
@@ -294,19 +335,24 @@ get_network_interface() {
         if [ -n "$MONITORED_NETWORK" ]; then
 		# Manual override
                 _RET="$MONITORED_NETWORK"
-        elif [ -e /proc/net/route ]; then
-		# Linux systems, read route and interface from procfs
+        elif [ -r /proc/net/route ]; then
+		# Linux systems, read route and interface from procfs.
+		# -r (not just -e): some hardened/sandboxed environments (Android
+		# via Termux/proot) expose the /proc/net/route dentry but deny
+		# reads with EACCES; under `set -e`, a redirection failure on the
+		# `while read ... done < /proc/net/route` below aborts the whole
+		# (sourced) calling script -- byobu.in itself, at startup, for
+		# callers that reach here through ip_address. GH #121
 		local Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
 		while read Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT; do
 			[ "$Mask" = "00000000" ] && break
 		done < /proc/net/route
 		_RET="$Iface"
 	elif eval $BYOBU_TEST route >/dev/null 2>&1; then
-		# Route command on path
-		_RET=$(route get default|grep interface:|awk '{print $2}')
+		# BSD/macOS: use route to find the default interface
+		_RET=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2 }')
 	elif [ -x "/sbin/route" ]; then
-		# Mac OSX, shell out to the route command
-		_RET=$(/sbin/route get default|grep interface:|awk '{print $2}')
+		_RET=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ { print $2 }')
 	fi
 }
 
@@ -362,7 +408,7 @@ get_distro() {
 	elif eval $BYOBU_TEST sw_vers >/dev/null 2>&1; then
 		distro="$(sw_vers -productName)"
 	elif eval $BYOBU_TEST uname >/dev/null 2>&1; then
-		distro="$(uname -s)"
+		distro="$BYOBU_OSTYPE"
 	else
 		distro="Byobu"
 	fi

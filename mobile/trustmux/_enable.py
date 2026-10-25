@@ -1,0 +1,174 @@
+"""trustmux enable — start Trustmux daemon and enable it at login."""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+from trustmux._advertise import ADVERTISE_ENV
+from trustmux._ctl import (DEFAULT_PORT, can_use_serve, cmd_setup, cmd_start,
+                           port_opt)
+from trustmux._paths import Instance
+
+_HOOK = "trustmux start 2>/dev/null || true\n"
+
+_LOGIN_FILES = [
+    Path.home() / ".profile",
+    Path.home() / ".bash_profile",
+    Path.home() / ".bash_login",
+]
+if "zsh" in os.environ.get("SHELL", ""):
+    _LOGIN_FILES.append(Path.home() / ".zprofile")
+
+
+def hook_line(port: int = DEFAULT_PORT, inst: Instance | None = None) -> str:
+    """Login hook to install. Only carries --name/--port when they are not
+    the defaults, so profiles written by older versions stay byte-identical."""
+    inst = inst or Instance()
+    return f"trustmux start{inst.label()}{port_opt(port)} 2>/dev/null || true\n"
+
+
+def is_hook_line(line: str) -> bool:
+    """True for a trustmux login hook in any version's format."""
+    return "trustmux-ctl" in line or ("trustmux start" in line and "2>/dev/null" in line)
+
+
+# The flag that names an instance was called --instance before it was --name.
+# Hooks live in ~/.profile and are not rewritten on upgrade, so a hook written
+# by the older spelling has to stay recognisable or `disable`/`rm` would leave
+# it behind to resurrect an instance that no longer exists.
+_NAME_FLAGS = ("--name", "--instance")
+
+
+def is_hook_for(line: str, inst: Instance | None = None) -> bool:
+    """True for a hook line belonging to this instance.
+
+    Each instance owns one line, so enabling a second instance appends rather
+    than overwriting the first.
+    """
+    inst = inst or Instance()
+    if not is_hook_line(line):
+        return False
+    # A trailing \s|$ boundary, not a bare substring check: one instance name
+    # being a prefix of another's (e.g. "work" and "workstation") must not
+    # make enable/disable/rm on one clobber or drop the other's hook line.
+    if any(re.search(rf"{re.escape(flag)} {re.escape(inst.name)}(?:\s|$)", line)
+           for flag in _NAME_FLAGS):
+        return True
+    # A hook that names no instance is the default instance's.
+    return (inst.name == Instance().name
+            and not any(flag in line for flag in _NAME_FLAGS))
+
+
+def rewrite_in_place(dest: Path, text: str) -> None:
+    """Replace dest's contents atomically, keeping its mode.
+
+    write_text() truncates first and writes second; a crash between the two
+    leaves an empty ~/.profile.  Write beside it and rename over it instead.
+    """
+    mode = dest.stat().st_mode & 0o777
+    tmp = dest.with_name(f".{dest.name}.trustmux-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dest)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _install_hook(dest: Path, hook: str = _HOOK, inst: Instance | None = None) -> None:
+    if not dest.exists():
+        return
+    inst = inst or Instance()
+    lines = dest.read_text().splitlines(keepends=True)
+    if any(is_hook_for(l, inst) for l in lines):
+        # Rewrite in place so `enable --port N` updates this instance's hook
+        # instead of silently keeping the old port.
+        updated = [hook if is_hook_for(l, inst) else l for l in lines]
+        if updated != lines:
+            rewrite_in_place(dest, "".join(updated))
+        return
+    with dest.open("a") as f:
+        f.write(f"\n{hook}")
+
+
+def _warn_transient_advertise(advertise: list[str] | None,
+                              no_advertise: bool = False,
+                              inst: Instance | None = None) -> None:
+    """Say so if the advertise source will not survive to the next login.
+
+    The hook this command writes deliberately carries no --advertise: the
+    durable home for a source is the instance's config file, which is also the
+    only one `trustmux start` from a hook will consult.  A source given on the
+    command line applies to this daemon and then vanishes, which is worth one
+    line rather than a surprise after the next reboot.
+    """
+    inst = inst or Instance()
+    if no_advertise:
+        return          # nothing was advertised, so nothing is being lost
+    origin = "--advertise" if advertise else (
+        f"${ADVERTISE_ENV}" if os.environ.get(ADVERTISE_ENV, "").strip() else "")
+    if not origin:
+        return
+    print("", file=sys.stderr)
+    print(f"Note: the advertise source came from {origin}, so the login hook "
+          "will not use it.", file=sys.stderr)
+    print(f"  To make it stick, put it in {inst.config_file}:", file=sys.stderr)
+    print('    {"advertise": ' + json.dumps(advertise or
+          [os.environ.get(ADVERTISE_ENV, "").strip()]) + "}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+
+def main(port: int = DEFAULT_PORT, inst: Instance | None = None,
+         advertise: list[str] | None = None, no_advertise: bool = False) -> None:
+    inst = inst or Instance()
+    # enable == setup + start in serve mode + login hook, so it inherits the
+    # serve restriction. Check up front: otherwise cmd_setup refuses and the
+    # generic "re-run trustmux enable" hint below would just loop.
+    if not can_use_serve(inst):
+        print("", file=sys.stderr)
+        print("  To start it at login anyway, add one of the above to your shell",
+              file=sys.stderr)
+        print("  profile yourself — `enable` only manages serve-mode instances.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if cmd_setup(quiet=True, port=port, inst=inst) != 0:
+        print("\nFirst-time setup did not complete. Fix the issue above, then re-run:")
+        print(f"  trustmux enable{inst.label()}{port_opt(port)}")
+        sys.exit(1)
+
+    hook = hook_line(port, inst)
+    for f in _LOGIN_FILES:
+        _install_hook(f, hook, inst)
+
+    started = cmd_start("serve", port, inst, advertise, no_advertise) == 0
+    # Regardless of whether this invocation started it: the hook was just
+    # written either way, and it is the hook that will not carry the source.
+    _warn_transient_advertise(advertise, no_advertise, inst)
+
+    print()
+    if started:
+        print("Trustmux daemon started and will launch automatically at each login.")
+    else:
+        print("Trustmux daemon is already running and will launch automatically at each login.")
+    print()
+
+    tokens = inst.tokens_file
+    if not tokens.exists() or tokens.stat().st_size == 0:
+        print("Next step — pair your phone:")
+        print(f"  trustmux pair{inst.label()}")
+        print()
+        print("Open the URL printed above in your phone's browser, enter the code, and tap Pair.")
+        print()
+
+    print("To stop and disable later, run:")
+    print(f"  trustmux disable{inst.label()}")
+    print()
+
+
+if __name__ == "__main__":
+    main()

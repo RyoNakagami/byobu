@@ -22,6 +22,15 @@
 ___get_dev_list() {
 	if [ -n "$MONITORED_NETWORK" ]; then
 		echo "$MONITORED_NETWORK"
+	elif [ "$BYOBU_OSTYPE" = "OpenBSD" ]; then
+		# OpenBSD: list wireless interfaces by known driver prefixes.
+		# Update this list when new wireless drivers are added to OpenBSD.
+		# See: man 4 iwx, man 4 iwm, etc. in the OpenBSD kernel source.
+		for _if in $(ifconfig 2>/dev/null | grep '^[a-z]' | cut -d: -f1); do
+			case "$_if" in
+				iwn*|iwm*|iwx*|athn*|ath*|rum*|run*|urtwn*|rtwn*) echo "$_if" ;;
+			esac
+		done
 	else
 		iw dev | grep Interface | cut -f2 -d\ 
 	fi
@@ -42,16 +51,32 @@ __wifi_quality_detail() {
 
 __wifi_quality() {
 	local out bitrate quality
-	if eval $BYOBU_TEST iwconfig >/dev/null 2>&1; then
+	# OpenBSD: parse ifconfig for signal strength
+	if [ "$BYOBU_OSTYPE" = "OpenBSD" ]; then
+		local dev sig
+		for dev in $(___get_dev_list); do
+			sig=$(ifconfig "$dev" 2>/dev/null | awk '/ [0-9-]+dBm/ { for(i=1;i<=NF;i++) if ($i ~ /dBm$/) { gsub(/dBm/,"",$i); print $i; exit } }')
+			if [ -n "$sig" ]; then
+				# Convert dBm to quality percentage
+				quality=$(( (sig + 110) * 100 / 70 ))
+				[ "$quality" -gt 100 ] && quality=100
+				[ "$quality" -lt 0 ] && quality=0
+				bitrate=$(ifconfig "$dev" 2>/dev/null | awk '/media:.*Mb/ { for(i=1;i<=NF;i++) if ($i ~ /Mb/) { gsub(/Mb.*/,"",$i); print $i; exit } }')
+				[ -n "$bitrate" ] || bitrate=0
+				break
+			fi
+		done
+	fi
+	if [ -z "$quality" ] && eval $BYOBU_TEST iwconfig >/dev/null 2>&1; then
 		# iwconfig is expected to output lines like:
 		#    Bit Rate=54 Mb/s   Tx-Power=15 dBm
 		#    Link Quality=60/70  Signal level=-50 dBm
 		# the awk below tokenizes the output and prints shell evalable results
-		out=`iwconfig $MONITORED_NETWORK 2>/dev/null |
+		out=`iwconfig "$MONITORED_NETWORK" 2>/dev/null |
 			awk '$0 ~ /[ ]*Link Quality./ {
 			    sub(/.*=/,"",$2); split($2,a,"/");
 			    printf "quality=%.0f\n", 100*a[1]/a[2] };
-			    $0 ~ /[ ]*Bit Rate/ { sub(/.*[:=]/,"",$2); printf("bitrate=%s\n", $2); }
+			    $0 ~ /[ ]*Bit Rate/ { sub(/.*[:=]/,"",$2); printf("bitrate=%.1f\n", $2+0); }
 			    '`
 		eval "$out"
 	elif eval $BYOBU_TEST iw >/dev/null 2>&1; then
@@ -64,7 +89,7 @@ __wifi_quality() {
 			out=`iw dev "$dev" link 2>/dev/null |
 				awk '$0 ~ /^\s*signal:/ { a = 100 * ($2 + 110) / 70;
 				    printf "quality=%.0f\n", (a > 100) ? 100 : ((a < 0) ? 0 : a); }
-				    $0 ~ /^\s*rx bitrate:/ { printf "bitrate=%s\n", $3; }
+				    $0 ~ /^\s*rx bitrate:/ { printf "bitrate=%.1f\n", $3+0; }
 				    '`
 			eval "$out"
 			[ -z "$bitrate" ] || [ -z "$quality" ] || break

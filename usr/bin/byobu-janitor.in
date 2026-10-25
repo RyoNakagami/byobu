@@ -29,7 +29,7 @@ PKG="byobu"
 rm -rf "$BYOBU_RUN_DIR/.last.$BYOBU_BACKEND"
 
 # Ensure that we re-check metadata service
-rm -f "$BYOBU_CONFIG_DIR/.metadata_available" "$BYOBU_RUN_DIR/.metadata_available"
+rm -f "$BYOBU_CONFIG_DIR/.metadata_available" "$BYOBU_RUN_DIR/.metadata_available" 2>/dev/null || true
 
 # Exit immediately, if we're not forced, and there is no reload flag
 FLAG="$BYOBU_RUN_DIR/reload-required"
@@ -76,6 +76,9 @@ MC=0
 # Setup initial local user configuration
 [ -r "$BYOBU_CONFIG_DIR/color" ] || printf "BACKGROUND=k\nFOREGROUND=w\nMONOCHROME=$MC" > "$BYOBU_CONFIG_DIR/color"
 [ -r "$BYOBU_CONFIG_DIR/color.tmux" ] || sed -e "s/^#.*//" -e "/^\s*$/d" -e "s/^export //" "$BYOBU_PREFIX/lib/$PKG/include/colors"  > "$BYOBU_CONFIG_DIR/color.tmux"
+# Affects: tmux 3.6 rejects \#RRGGBB hex escape — strip the backslash (GH: #105)
+# Skip sed -i if color.tmux is a symlink — sed -i replaces symlinks with regular files (GH: #112)
+[ -L "$BYOBU_CONFIG_DIR/color.tmux" ] || sed -i 's/="\\#/="#/g' "$BYOBU_CONFIG_DIR/color.tmux" 2>/dev/null || true
 [ -r "$BYOBU_CONFIG_DIR/datetime.tmux" ] || printf 'BYOBU_DATE="%%Y-%%m-%%d "\nBYOBU_TIME="%%H:%%M:%%S"\n' > "$BYOBU_CONFIG_DIR/datetime.tmux"
 [ -r "$BYOBU_CONFIG_DIR/profile" ] || echo "source \$BYOBU_PREFIX/share/$PKG/profiles/common" > "$BYOBU_CONFIG_DIR/profile"
 [ -r "$BYOBU_CONFIG_DIR/profile.tmux" ] || echo "source \$BYOBU_PREFIX/share/$PKG/profiles/tmux" > "$BYOBU_CONFIG_DIR/profile.tmux"
@@ -86,6 +89,17 @@ MC=0
 [ -r "$BYOBU_CONFIG_DIR/backend" ] || echo "BYOBU_BACKEND=$BYOBU_BACKEND" > "$BYOBU_CONFIG_DIR/backend"
 [ -r "$BYOBU_CONFIG_DIR/.screenrc" ] || touch "$BYOBU_CONFIG_DIR/.screenrc"
 [ -r "$BYOBU_CONFIG_DIR/.tmux.conf" ] || touch "$BYOBU_CONFIG_DIR/.tmux.conf"
+# BYOBU_SHELL_ARGS: if set in statusrc, write a shellinit.tmux that overrides
+# tmux's default-command so new windows/panes start with those args (e.g.
+# --login to source /etc/profile.d).  LP: #1618516
+[ -r "$BYOBU_CONFIG_DIR/statusrc" ] && . "$BYOBU_CONFIG_DIR/statusrc" 2>/dev/null || true
+_shellinit="$BYOBU_CONFIG_DIR/shellinit.tmux"
+if [ -n "$BYOBU_SHELL_ARGS" ]; then
+	printf 'set -g default-command "exec $SHELL %s"\n' "$BYOBU_SHELL_ARGS" > "$_shellinit"
+else
+	[ -f "$_shellinit" ] || touch "$_shellinit"
+fi
+unset _shellinit
 for f in status statusrc; do
 	if [ ! -r "$BYOBU_CONFIG_DIR/$f" ]; then
 		# Copy from skeleton, if possible
@@ -104,7 +118,7 @@ fi
 # Affects: Upgrades from <= byobu-2.78 which might have "motd+shell"
 # in their window list; update this to just "shell"
 if grep -qs "motd+shell" "$BYOBU_CONFIG_DIR/windows"; then
-	$BYOBU_SED_INLINE -e "s/motd+shell/shell/g" "$($BYOBU_READLINK -f $BYOBU_CONFIG_DIR/windows)" || true
+	$BYOBU_SED_INLINE -e "s/motd+shell/shell/g" "$($BYOBU_READLINK -f "$BYOBU_CONFIG_DIR/windows")" || true
 fi
 
 # Affects: Upgrades from <= byobu 4.3, remove ec2_rates
@@ -112,7 +126,7 @@ rm -f "$BYOBU_CONFIG_DIR/ec2_rates"
 
 # Affects: Upgrades from <= byobu 4.4, update "shell" -> "byobu-shell"
 if grep -qs " shell$" "$BYOBU_CONFIG_DIR/windows"; then
-	$BYOBU_SED_INLINE -e "s/ shell$/ $PKG-shell/g" "$($BYOBU_READLINK -f $BYOBU_CONFIG_DIR/windows)" || true
+	$BYOBU_SED_INLINE -e "s/ shell$/ $PKG-shell/g" "$($BYOBU_READLINK -f "$BYOBU_CONFIG_DIR/windows")" || true
 fi
 
 # Affects: Upgrades from <= byobu 4.22

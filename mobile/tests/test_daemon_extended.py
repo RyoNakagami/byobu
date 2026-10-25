@@ -1,0 +1,1330 @@
+"""Extended test suite for Trustmux daemon.
+
+Covers: token persistence, security headers, static handlers, MachinesHandler,
+tmux list/write ops, byobu status chips, admin socket protocol, WebSocket handler.
+"""
+
+import asyncio
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch, MagicMock, AsyncMock
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import trustmux._daemon as bm
+
+from tornado.testing import AsyncHTTPTestCase, gen_test
+from tornado.websocket import websocket_connect
+from tornado.httpclient import HTTPRequest
+from tornado.httputil import HTTPHeaders
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared across test classes
+# ---------------------------------------------------------------------------
+
+def _add_session(token='tok_ext_test'):
+    bm._sessions[token] = {
+        'ip': '127.0.0.1',
+        'paired_at': time.time(),
+        'label': 'test-agent/1.0',
+    }
+    return token
+
+
+def _clear_sessions():
+    bm._sessions.clear()
+
+
+# ---------------------------------------------------------------------------
+# Stale admin socket
+# ---------------------------------------------------------------------------
+
+class TestStaleSocket(unittest.TestCase):
+    """The state directory persists across logout and reboot, so a socket left
+    behind by a killed daemon stays on disk. Connecting is what distinguishes
+    it from one a live daemon is serving -- unlinking blindly would let a
+    second daemon steal a live socket, leaving the first unreachable."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.path = Path(self.td.name) / 'trustmux.sock'
+
+    def test_leftover_socket_file_is_stale(self):
+        import socket as _socket
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.bind(str(self.path))
+        s.listen(1)
+        s.close()                       # daemon died without unlinking
+        self.assertTrue(self.path.exists())
+        self.assertTrue(bm._socket_is_stale(self.path))
+
+    def test_live_socket_is_not_stale(self):
+        import socket as _socket
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.bind(str(self.path))
+        s.listen(1)
+        self.addCleanup(s.close)
+        self.assertFalse(bm._socket_is_stale(self.path))
+
+    def test_missing_socket_is_stale(self):
+        self.assertTrue(bm._socket_is_stale(self.path))
+
+# ---------------------------------------------------------------------------
+# Instance selection
+# ---------------------------------------------------------------------------
+
+class TestSetInstance(unittest.TestCase):
+    """--name repoints every path the daemon owns."""
+
+    def setUp(self):
+        self._orig = (bm.INSTANCE, bm.STATE_DIR, bm.TOKENS_FILE,
+                      bm.ADMIN_SOCK, bm.CERT_FILE, bm.KEY_FILE)
+
+    def tearDown(self):
+        (bm.INSTANCE, bm.STATE_DIR, bm.TOKENS_FILE,
+         bm.ADMIN_SOCK, bm.CERT_FILE, bm.KEY_FILE) = self._orig
+
+    def test_repoints_state_and_runtime(self):
+        from trustmux._paths import Instance
+        work = Instance('work')
+        bm._set_instance(work)
+        self.assertEqual(bm.TOKENS_FILE, work.tokens_file)
+        self.assertEqual(bm.ADMIN_SOCK, work.sock)
+        self.assertEqual(bm.CERT_FILE, work.cert_file)
+        self.assertEqual(bm.KEY_FILE, work.key_file)
+        self.assertEqual(bm.STATE_DIR, work.state)
+
+    def test_two_instances_never_collide(self):
+        from trustmux._paths import Instance
+        bm._set_instance(Instance('a'))
+        a = (bm.TOKENS_FILE, bm.ADMIN_SOCK, bm.CERT_FILE)
+        bm._set_instance(Instance('b'))
+        b = (bm.TOKENS_FILE, bm.ADMIN_SOCK, bm.CERT_FILE)
+        for x, y in zip(a, b):
+            self.assertNotEqual(x, y)
+
+    def test_machines_file_stays_shared(self):
+        from trustmux._paths import Instance, machines_file
+        before = bm.MACHINES_FILE
+        bm._set_instance(Instance('work'))
+        self.assertEqual(bm.MACHINES_FILE, before)
+        self.assertEqual(bm.MACHINES_FILE, machines_file())
+
+
+# ---------------------------------------------------------------------------
+# Token persistence
+# ---------------------------------------------------------------------------
+
+class TestTokenPersistence(unittest.TestCase):
+    def setUp(self):
+        _clear_sessions()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig_state = bm.STATE_DIR
+        self._orig_tokens = bm.TOKENS_FILE
+        bm.STATE_DIR = Path(self._tmpdir.name) / 'trustmux'
+        bm.TOKENS_FILE = bm.STATE_DIR / 'tokens.json'
+
+    def tearDown(self):
+        _clear_sessions()
+        bm.STATE_DIR = self._orig_state
+        bm.TOKENS_FILE = self._orig_tokens
+        self._tmpdir.cleanup()
+
+    def _write_tokens(self, data):
+        bm.STATE_DIR.mkdir(parents=True)
+        bm.TOKENS_FILE.write_text(json.dumps(data))
+
+    def test_load_missing_file_is_no_op(self):
+        bm._load_tokens()
+        self.assertEqual(bm._sessions, {})
+
+    def test_load_valid_tokens(self):
+        self._write_tokens({'mytoken': {'ip': '1.2.3.4', 'paired_at': time.time(), 'label': 'x'}})
+        bm._load_tokens()
+        self.assertIn('mytoken', bm._sessions)
+        self.assertEqual(bm._sessions['mytoken']['ip'], '1.2.3.4')
+
+    def test_load_skips_malformed_records(self):
+        self._write_tokens({
+            'good': {'ip': '1.1.1.1', 'paired_at': time.time(), 'label': ''},
+            'bad_str': 'not-a-dict',
+            'bad_missing': {'label': 'no ip or paired_at'},
+        })
+        bm._load_tokens()
+        self.assertIn('good', bm._sessions)
+        self.assertNotIn('bad_str', bm._sessions)
+        self.assertNotIn('bad_missing', bm._sessions)
+
+    def test_load_corrupt_json_does_not_raise(self):
+        bm.STATE_DIR.mkdir(parents=True)
+        bm.TOKENS_FILE.write_text('not json!!!')
+        bm._load_tokens()
+        self.assertEqual(bm._sessions, {})
+
+    def test_load_wrong_root_type_ignored(self):
+        self._write_tokens([1, 2, 3])
+        bm._load_tokens()
+        self.assertEqual(bm._sessions, {})
+
+    def test_save_creates_tokens_file(self):
+        bm._sessions['tok123'] = {'ip': '9.9.9.9', 'paired_at': time.time(), 'label': 'y'}
+        bm._save_tokens()
+        self.assertTrue(bm.TOKENS_FILE.exists())
+        data = json.loads(bm.TOKENS_FILE.read_text())
+        self.assertIn('tok123', data)
+        self.assertEqual(data['tok123']['ip'], '9.9.9.9')
+
+    def test_save_file_mode_600(self):
+        bm._sessions['tok456'] = {'ip': '1.1.1.1', 'paired_at': time.time(), 'label': ''}
+        bm._save_tokens()
+        mode = oct(bm.TOKENS_FILE.stat().st_mode)[-3:]
+        self.assertEqual(mode, '600')
+
+    def test_save_and_reload_roundtrip(self):
+        bm._sessions['roundtrip'] = {'ip': '5.5.5.5', 'paired_at': time.time(), 'label': 'rt'}
+        bm._save_tokens()
+        _clear_sessions()
+        bm._load_tokens()
+        self.assertIn('roundtrip', bm._sessions)
+
+    def test_valid_session_token_true_for_known(self):
+        bm._sessions['abc123'] = {'ip': '1.1.1.1', 'paired_at': time.time(), 'label': ''}
+        self.assertTrue(bm._valid_session_token('abc123'))
+
+    def test_valid_session_token_false_for_unknown(self):
+        self.assertFalse(bm._valid_session_token('nosuchtoken'))
+
+    def test_valid_session_token_false_for_empty(self):
+        self.assertFalse(bm._valid_session_token(''))
+
+
+# ---------------------------------------------------------------------------
+# Security headers — present on all endpoints
+# ---------------------------------------------------------------------------
+
+class TestSecurityHeaders(AsyncHTTPTestCase):
+    def get_app(self):
+        return bm._make_app()
+
+    def setUp(self):
+        super().setUp()
+        _clear_sessions()
+
+    def tearDown(self):
+        _clear_sessions()
+        super().tearDown()
+
+    def _assert_security_headers(self, resp):
+        h = resp.headers
+        self.assertIn('DENY', h.get('X-Frame-Options', ''), 'X-Frame-Options missing')
+        csp = h.get('Content-Security-Policy', '')
+        self.assertIn('default-src', csp, 'CSP missing')
+        self.assertNotIn("'unsafe-inline'", csp.split('script-src')[1].split(';')[0]
+                         if 'script-src' in csp else '', 'script-src must not allow unsafe-inline')
+        self.assertIn('no-referrer', h.get('Referrer-Policy', ''), 'Referrer-Policy missing')
+        self.assertIn('nosniff', h.get('X-Content-Type-Options', ''), 'X-Content-Type-Options missing')
+
+    def test_ping_has_security_headers(self):
+        self._assert_security_headers(self.fetch('/ping'))
+
+    def test_manifest_has_security_headers(self):
+        self._assert_security_headers(self.fetch('/manifest.json'))
+
+    def test_status_has_security_headers(self):
+        self._assert_security_headers(self.fetch('/status'))
+
+    def test_pair_post_has_security_headers(self):
+        bm._pair_code = '123456'
+        bm._pair_code_mono_expiry = time.monotonic() + 300
+        resp = self.fetch('/pair', method='POST', body='{}',
+                          headers={'Content-Type': 'application/json'})
+        self._assert_security_headers(resp)
+        bm._pair_code = ''
+
+
+# ---------------------------------------------------------------------------
+# Static file handlers
+# ---------------------------------------------------------------------------
+
+class TestStaticHandlers(AsyncHTTPTestCase):
+    def get_app(self):
+        return bm._make_app()
+
+    def test_index_content_type_html(self):
+        resp = self.fetch('/')
+        self.assertEqual(resp.code, 200)
+        self.assertIn('text/html', resp.headers.get('Content-Type', ''))
+
+    def test_service_worker_no_cache(self):
+        resp = self.fetch('/sw.js')
+        self.assertEqual(resp.code, 200)
+        self.assertIn('no-cache', resp.headers.get('Cache-Control', ''))
+
+    def test_service_worker_content_type_js(self):
+        resp = self.fetch('/sw.js')
+        self.assertIn('javascript', resp.headers.get('Content-Type', ''))
+
+    def test_svg_content_type(self):
+        resp = self.fetch('/trustmux.svg')
+        self.assertEqual(resp.code, 200)
+        self.assertIn('svg', resp.headers.get('Content-Type', ''))
+
+    def test_svg_has_cache_header(self):
+        resp = self.fetch('/trustmux.svg')
+        self.assertIn('max-age', resp.headers.get('Cache-Control', ''))
+
+    def test_icon_invalid_name_returns_404(self):
+        resp = self.fetch('/icons/nonexistent_icon_99999.png')
+        self.assertEqual(resp.code, 404)
+
+    def test_icon_path_traversal_blocked(self):
+        resp = self.fetch('/icons/../trustmux.svg')
+        # Tornado routing won't match this; should 404
+        self.assertIn(resp.code, (404, 400))
+
+    def test_icon_name_with_illegal_chars_returns_404(self):
+        resp = self.fetch('/icons/foo;bar.png')
+        self.assertEqual(resp.code, 404)
+
+    def test_icon_existing_returns_200(self):
+        resp = self.fetch('/icons/icon-192.png')
+        self.assertEqual(resp.code, 200)
+        self.assertEqual(resp.headers.get('Content-Type'), 'image/png')
+
+    def test_icon_cache_header(self):
+        resp = self.fetch('/icons/icon-192.png')
+        self.assertIn('no-cache', resp.headers.get('Cache-Control', ''))
+
+    def test_font_invalid_name_returns_404(self):
+        resp = self.fetch('/fonts/nonexistent_font_99999.woff2')
+        self.assertEqual(resp.code, 404)
+
+    def test_font_path_traversal_blocked(self):
+        resp = self.fetch('/fonts/../trustmux.svg')
+        self.assertIn(resp.code, (404, 400))
+
+    def test_font_name_with_illegal_chars_returns_404(self):
+        resp = self.fetch('/fonts/foo;bar.woff2')
+        self.assertEqual(resp.code, 404)
+
+    def test_font_wrong_extension_returns_404(self):
+        # Only .woff2 is servable here -- LICENSE ships alongside the fonts
+        # on disk for packaging compliance, not as something the PWA fetches.
+        resp = self.fetch('/fonts/LICENSE')
+        self.assertEqual(resp.code, 404)
+
+    def test_font_existing_returns_200(self):
+        resp = self.fetch('/fonts/DejaVuSansMono.woff2')
+        self.assertEqual(resp.code, 200)
+        self.assertEqual(resp.headers.get('Content-Type'), 'font/woff2')
+
+    def test_font_cache_header_is_long_lived(self):
+        # Unlike icons (no-cache): this file never changes without also
+        # changing its own filename, so a long-lived cache is safe.
+        resp = self.fetch('/fonts/DejaVuSansMono.woff2')
+        cc = resp.headers.get('Cache-Control', '')
+        self.assertIn('max-age=31536000', cc)
+        self.assertIn('immutable', cc)
+
+    def test_app_js_returns_200_with_js_content_type(self):
+        resp = self.fetch('/app.js')
+        self.assertEqual(resp.code, 200)
+        self.assertIn('javascript', resp.headers.get('Content-Type', ''))
+
+    def test_app_js_no_cache(self):
+        resp = self.fetch('/app.js')
+        self.assertIn('no-cache', resp.headers.get('Cache-Control', ''))
+
+    def test_app_js_contains_strict_mode(self):
+        resp = self.fetch('/app.js')
+        self.assertIn(b"'use strict'", resp.body)
+
+
+# ---------------------------------------------------------------------------
+# MachinesHandler
+# ---------------------------------------------------------------------------
+
+class TestMachinesHandler(AsyncHTTPTestCase):
+    def get_app(self):
+        return bm._make_app()
+
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig = bm.MACHINES_FILE
+        bm.MACHINES_FILE = Path(self._tmpdir.name) / 'machines.json'
+        # Create a valid session token for auth-required requests
+        self._auth_token = 'test_machines_token'
+        bm._sessions[self._auth_token] = {'ip': '127.0.0.1', 'paired_at': time.time(), 'label': 'test'}
+
+    def tearDown(self):
+        bm._sessions.pop(self._auth_token, None)
+        bm.MACHINES_FILE = self._orig
+        self._tmpdir.cleanup()
+        super().tearDown()
+
+    def _auth_fetch(self, path):
+        return self.fetch(path, headers={'Cookie': f'trustmux_session={self._auth_token}'})
+
+    def test_no_file_returns_only_current(self):
+        resp = self._auth_fetch('/machines')
+        self.assertEqual(resp.code, 200)
+        data = json.loads(resp.body)
+        self.assertEqual(len(data), 1)
+        self.assertTrue(data[0]['current'])
+
+    def test_with_siblings_returns_all(self):
+        siblings = [
+            {'name': 'work', 'url': 'https://work.ts.net'},
+            {'name': 'home', 'url': 'https://home.ts.net'},
+        ]
+        bm.MACHINES_FILE.write_text(json.dumps(siblings))
+        resp = self._auth_fetch('/machines')
+        data = json.loads(resp.body)
+        self.assertEqual(len(data), 3)
+        urls = [m['url'] for m in data]
+        self.assertIn('https://work.ts.net', urls)
+
+    def test_malformed_entry_skipped(self):
+        siblings = [
+            {'name': 'good', 'url': 'https://good.ts.net'},
+            {'missing_url': True},
+        ]
+        bm.MACHINES_FILE.write_text(json.dumps(siblings))
+        resp = self._auth_fetch('/machines')
+        data = json.loads(resp.body)
+        # Only current + 'good'; malformed entry absent
+        self.assertEqual(len(data), 2)
+
+    def test_non_list_json_returns_current_only(self):
+        bm.MACHINES_FILE.write_text(json.dumps({'not': 'a list'}))
+        resp = self._auth_fetch('/machines')
+        data = json.loads(resp.body)
+        self.assertEqual(len(data), 1)
+
+    def test_corrupt_json_returns_500(self):
+        bm.MACHINES_FILE.write_text('not valid json!!!')
+        resp = self._auth_fetch('/machines')
+        self.assertEqual(resp.code, 500)
+
+    def test_corrupt_json_error_is_generic(self):
+        bm.MACHINES_FILE.write_text('not valid json!!!')
+        resp = self._auth_fetch('/machines')
+        data = json.loads(resp.body)
+        self.assertEqual(data.get('error'), 'internal error')
+
+    def test_javascript_url_in_machines_file_is_filtered(self):
+        siblings = [
+            {'name': 'good', 'url': 'https://good.ts.net'},
+            {'name': 'evil', 'url': 'javascript:alert(1)'},
+        ]
+        bm.MACHINES_FILE.write_text(json.dumps(siblings))
+        resp = self._auth_fetch('/machines')
+        data = json.loads(resp.body)
+        urls = [m['url'] for m in data]
+        self.assertNotIn('javascript:alert(1)', urls)
+        self.assertIn('https://good.ts.net', urls)
+
+    def test_unauthenticated_returns_401(self):
+        resp = self.fetch('/machines')
+        self.assertEqual(resp.code, 401)
+
+
+# ---------------------------------------------------------------------------
+# tmux_list_sessions parsing
+# ---------------------------------------------------------------------------
+
+class TestTmuxListSessions(unittest.TestCase):
+    def _run(self, sess_output):
+        def fake_tmux(*args):
+            if 'list-sessions' in args:
+                return sess_output
+            if 'list-windows' in args:
+                return '@0\t0\tmain\t1\n'
+            return '%0\t0\t1\tbash\t123\n'
+        with patch.object(bm, '_tmux', side_effect=fake_tmux):
+            return bm.tmux_list_sessions()
+
+    def test_parses_attached_session(self):
+        sessions = self._run('$0\tmysession\t1\n')
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]['id'], '$0')
+        self.assertEqual(sessions[0]['name'], 'mysession')
+        self.assertTrue(sessions[0]['attached'])
+
+    def test_parses_detached_session(self):
+        sessions = self._run('$1\twork\t0\n')
+        self.assertFalse(sessions[0]['attached'])
+
+    def test_multiple_sessions(self):
+        sessions = self._run('$0\ta\t1\n$1\tb\t0\n')
+        self.assertEqual(len(sessions), 2)
+
+    def test_empty_output(self):
+        self.assertEqual(self._run(''), [])
+
+    def test_session_has_windows_list(self):
+        sessions = self._run('$0\tmain\t1\n')
+        self.assertIn('windows', sessions[0])
+        self.assertIsInstance(sessions[0]['windows'], list)
+
+
+# ---------------------------------------------------------------------------
+# tmux write operations
+# ---------------------------------------------------------------------------
+
+class TestTmuxWriteOps(unittest.TestCase):
+    def _capture(self, fn, *args, **kwargs):
+        calls = []
+        with patch.object(bm, '_tmux', side_effect=lambda *a: calls.append(a) or ''), \
+             patch('time.sleep'):
+            fn(*args, **kwargs)
+        return calls
+
+    def test_new_session_args(self):
+        calls = self._capture(bm.tmux_new_session, 'mysession')
+        self.assertEqual(len(calls), 1)
+        self.assertIn('new-session', calls[0])
+        self.assertIn('-d', calls[0])
+        self.assertIn('-s', calls[0])
+        self.assertIn('mysession', calls[0])
+
+    def test_new_window_with_name(self):
+        calls = self._capture(bm.tmux_new_window, '$0', 'vim')
+        self.assertIn('new-window', calls[0])
+        self.assertIn('-n', calls[0])
+        self.assertIn('vim', calls[0])
+
+    def test_new_window_without_name_omits_n_flag(self):
+        calls = self._capture(bm.tmux_new_window, '$0', '')
+        self.assertIn('new-window', calls[0])
+        self.assertNotIn('-n', calls[0])
+
+    def test_new_pane_calls_split_window(self):
+        calls = self._capture(bm.tmux_new_pane, '@1')
+        self.assertIn('split-window', calls[0])
+        self.assertIn('@1', calls[0])
+
+    def test_send_keys_with_enter_sends_keys_then_enter(self):
+        # A shell-prompt probe (display-message) may run between the two
+        # send-keys; only the send-keys calls are the contract.
+        calls = self._capture(bm.tmux_send_keys, '%0', 'ls', True)
+        sends = [c for c in calls if 'send-keys' in c]
+        self.assertEqual(len(sends), 2)
+        self.assertIn('ls', sends[0])
+        self.assertIn('Enter', sends[1])
+
+    def test_send_keys_without_enter_makes_one_call(self):
+        calls = self._capture(bm.tmux_send_keys, '%0', 'ls', False)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('ls', calls[0])
+
+    def test_send_keys_uses_literal_flag(self):
+        calls = self._capture(bm.tmux_send_keys, '%0', 'my text', False)
+        self.assertIn('-l', calls[0])
+
+    def test_send_keys_literal_with_enter_settles_before_enter(self):
+        # Paste-burst-detecting TUIs (e.g. Codex CLI) swallow an Enter that
+        # arrives immediately after a literal paste as a newline instead of
+        # submit — regression test for GH #115.
+        with patch.object(bm, '_tmux', return_value=''), patch('time.sleep') as mock_sleep:
+            bm.tmux_send_keys('%0', 'ls', True, True)
+        mock_sleep.assert_called_once_with(bm._PASTE_BURST_SETTLE)
+
+    def test_send_keys_non_literal_with_enter_does_not_settle(self):
+        with patch.object(bm, '_tmux', return_value=''), patch('time.sleep') as mock_sleep:
+            bm.tmux_send_keys('%0', 'Enter', True, False)
+        mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Byobu status — _first_attr
+# ---------------------------------------------------------------------------
+
+class TestFirstAttr(unittest.TestCase):
+    def test_extracts_bg(self):
+        self.assertEqual(bm._first_attr('#[bg=blue,fg=white]text', 'bg='), 'blue')
+
+    def test_extracts_fg(self):
+        self.assertEqual(bm._first_attr('#[bg=black,fg=brightwhite]text', 'fg='), 'brightwhite')
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(bm._first_attr('plain text', 'bg='))
+
+    def test_empty_attr_value_returns_none(self):
+        self.assertIsNone(bm._first_attr('#[bg=]text', 'bg='))
+
+    def test_first_block_wins(self):
+        self.assertEqual(bm._first_attr('#[bg=red]#[bg=blue]', 'bg='), 'red')
+
+    def test_no_attr_blocks_returns_none(self):
+        self.assertIsNone(bm._first_attr('', 'bg='))
+
+
+# ---------------------------------------------------------------------------
+# Byobu status — _make_chip
+# ---------------------------------------------------------------------------
+
+class TestMakeChip(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shm = Path(self._tmpdir.name)
+        self._status_dir = self._shm / 'status.tmux'
+        self._status_dir.mkdir()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _write_chip(self, name, content):
+        (self._status_dir / name).write_text(content)
+
+    def test_logo_returns_chip_when_file_exists(self):
+        self._write_chip('logo', '#[default]#[fg=colour255,bg=colour202] u #[default]')
+        chip = bm._make_chip('logo', self._shm)
+        self.assertIsNotNone(chip)
+        self.assertEqual(chip['label'], 'logo')
+        self.assertEqual(chip['text'], 'u')
+        self.assertEqual(chip['bg'], '#ff5f00')   # colour202 = Ubuntu orange
+        self.assertEqual(chip['color'], '#eeeeee') # light text on dark bg
+
+    def test_logo_returns_none_when_file_missing(self):
+        self.assertIsNone(bm._make_chip('logo', self._shm))
+
+    def test_colour256_cube_maps_correctly(self):
+        self.assertEqual(bm._colour256_to_css('colour202'), '#ff5f00')
+        self.assertEqual(bm._colour256_to_css('colour255'), '#eeeeee')
+        self.assertEqual(bm._colour256_to_css('colour16'),  '#000000')
+
+    def test_colour256_greyscale_maps_correctly(self):
+        self.assertEqual(bm._colour256_to_css('colour232'), '#080808')
+        self.assertEqual(bm._colour256_to_css('colour244'), '#808080')
+
+    def test_colour256_chip_uses_correct_css(self):
+        self._write_chip('logo', '#[fg=colour255,bg=colour202] u ')
+        chip = bm._make_chip('logo', self._shm)
+        self.assertEqual(chip['bg'], '#ff5f00')
+
+    def test_missing_status_dir_returns_none(self):
+        shm2 = Path(self._tmpdir.name + '_2')
+        shm2.mkdir()
+        self.assertIsNone(bm._make_chip('uptime', shm2))
+
+    def test_missing_chip_file_returns_none(self):
+        self.assertIsNone(bm._make_chip('nonexistent', self._shm))
+
+    def test_all_whitespace_chip_returns_none(self):
+        self._write_chip('blank', '#[bg=blue]   #[fg=white]')
+        self.assertIsNone(bm._make_chip('blank', self._shm))
+
+    def test_valid_chip_returns_dict(self):
+        self._write_chip('uptime', '#[bg=blue,fg=white] 5 days #[default]')
+        chip = bm._make_chip('uptime', self._shm)
+        self.assertIsNotNone(chip)
+        self.assertEqual(chip['label'], 'uptime')
+        self.assertIn('5', chip['text'])
+        self.assertIn('bg', chip)
+        self.assertIn('color', chip)
+        self.assertIn('text', chip)
+
+    def test_named_color_maps_to_css_hex(self):
+        self._write_chip('time', '#[bg=cyan] 12:00 ')
+        chip = bm._make_chip('time', self._shm)
+        self.assertEqual(chip['bg'], bm._BG['cyan'])
+
+    def test_css_hex_color_passes_through(self):
+        self._write_chip('date', '#[bg=#ff00ff] Mon ')
+        chip = bm._make_chip('date', self._shm)
+        self.assertEqual(chip['bg'], '#ff00ff')
+
+    def test_light_bg_gives_dark_text(self):
+        self._write_chip('load', '#[bg=brightwhite] 1.2 ')
+        chip = bm._make_chip('load', self._shm)
+        self.assertEqual(chip['color'], '#111111')
+
+    def test_dark_bg_gives_light_text(self):
+        self._write_chip('mem', '#[bg=black] 512M ')
+        chip = bm._make_chip('mem', self._shm)
+        self.assertEqual(chip['color'], '#eeeeee')
+
+    def test_unknown_color_uses_fallback(self):
+        self._write_chip('cpu', '#[bg=unknowncolor] 50% ')
+        chip = bm._make_chip('cpu', self._shm)
+        self.assertEqual(chip['bg'], '#2d2d2d')
+
+
+# ---------------------------------------------------------------------------
+# Byobu status — read_byobu_status integration
+# ---------------------------------------------------------------------------
+
+class TestReadByobuStatus(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shm = Path(self._tmpdir.name)
+        status_dir = self._shm / 'status.tmux'
+        status_dir.mkdir()
+        (status_dir / 'uptime').write_text('#[bg=blue] 1 day ')
+        (status_dir / 'time').write_text('#[bg=cyan] 12:00 ')
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_returns_chips_when_shm_present(self):
+        with patch.object(bm, '_byobu_shm', return_value=self._shm):
+            with patch.object(bm, '_read_byobu_status_config',
+                              return_value=(['uptime'], ['time'])):
+                result = bm.read_byobu_status()
+        self.assertEqual(len(result['left']), 1)
+        self.assertEqual(len(result['right']), 1)
+        self.assertEqual(result['left'][0]['label'], 'uptime')
+        self.assertEqual(result['right'][0]['label'], 'time')
+
+    def test_empty_when_no_shm(self):
+        with patch.object(bm, '_byobu_shm', return_value=None):
+            result = bm.read_byobu_status()
+        self.assertEqual(result['left'], [])
+        self.assertEqual(result['right'], [])
+
+    def test_logo_chip_included_when_file_present(self):
+        status_dir = self._shm / 'status.tmux'
+        (status_dir / 'logo').write_text('#[fg=colour255,bg=colour202] u ')
+        with patch.object(bm, '_byobu_shm', return_value=self._shm):
+            with patch.object(bm, '_read_byobu_status_config',
+                              return_value=(['logo', 'uptime'], [])):
+                result = bm.read_byobu_status()
+        labels = [c['label'] for c in result['left']]
+        self.assertIn('logo', labels)
+        self.assertIn('uptime', labels)
+
+    def test_missing_chip_file_skipped(self):
+        with patch.object(bm, '_byobu_shm', return_value=self._shm):
+            with patch.object(bm, '_read_byobu_status_config',
+                              return_value=(['nonexistent_chip'], [])):
+                result = bm.read_byobu_status()
+        self.assertEqual(result['left'], [])
+
+
+# ---------------------------------------------------------------------------
+# Admin Unix socket protocol
+# ---------------------------------------------------------------------------
+
+class TestAdminSocket(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        _clear_sessions()
+        bm._pair_code = ''
+        bm._pair_attempts = 0
+        bm._pair_code_mono_expiry = 0.0
+        bm._pair_paired_ip = ''
+
+    def tearDown(self):
+        _clear_sessions()
+        bm._pair_code = ''
+        bm._pair_attempts = 0
+        bm._pair_code_mono_expiry = 0.0
+        bm._pair_paired_ip = ''
+
+    async def _call(self, payload) -> dict:
+        """Drive _handle_admin with mock reader/writer; return parsed response."""
+        line = json.dumps(payload).encode() + b'\n'
+        reader = asyncio.StreamReader()
+        reader.feed_data(line)
+        reader.feed_eof()
+        written = []
+        writer = MagicMock()
+        writer.write = lambda data: written.append(data)
+        writer.drain = AsyncMock()
+        writer.close = MagicMock()
+        writer.wait_closed = AsyncMock()
+        await bm._handle_admin(reader, writer)
+        return json.loads(b''.join(written).decode().strip())
+
+    async def _call_raw(self, raw_bytes: bytes) -> dict:
+        reader = asyncio.StreamReader()
+        reader.feed_data(raw_bytes)
+        reader.feed_eof()
+        written = []
+        writer = MagicMock()
+        writer.write = lambda data: written.append(data)
+        writer.drain = AsyncMock()
+        writer.close = MagicMock()
+        writer.wait_closed = AsyncMock()
+        await bm._handle_admin(reader, writer)
+        return json.loads(b''.join(written).decode().strip())
+
+    async def test_pair_generate_returns_code(self):
+        with patch.object(bm, '_print_pair_code'):
+            resp = await self._call({'action': 'pair_generate'})
+        self.assertIn('code', resp)
+        self.assertIn('-', resp['code'])
+        self.assertEqual(len(resp['code']), 7)  # XXX-XXX
+        self.assertIn('expires_in', resp)
+        self.assertTrue(bm._pair_code)
+
+    async def test_pair_status_pending_while_code_live(self):
+        with patch.object(bm, '_print_pair_code'):
+            await self._call({'action': 'pair_generate'})
+        resp = await self._call({'action': 'pair_status'})
+        self.assertEqual(resp['state'], 'pending')
+        self.assertGreater(resp['expires_in'], 0)
+        self.assertLessEqual(resp['expires_in'], bm._PAIR_CODE_TTL)
+
+    async def test_pair_status_paired_reports_ip(self):
+        bm._pair_paired_ip = '100.64.0.7'
+        resp = await self._call({'action': 'pair_status'})
+        self.assertEqual(resp, {'state': 'paired', 'ip': '100.64.0.7'})
+
+    async def test_pair_status_expired_without_code(self):
+        resp = await self._call({'action': 'pair_status'})
+        self.assertEqual(resp, {'state': 'expired'})
+
+    async def test_pair_status_expired_after_ttl(self):
+        bm._pair_code = '123456'
+        bm._pair_code_mono_expiry = time.monotonic() - 1
+        resp = await self._call({'action': 'pair_status'})
+        self.assertEqual(resp, {'state': 'expired'})
+
+    async def test_pair_generate_clears_previous_result(self):
+        bm._pair_paired_ip = '100.64.0.7'
+        with patch.object(bm, '_print_pair_code'):
+            await self._call({'action': 'pair_generate'})
+        resp = await self._call({'action': 'pair_status'})
+        self.assertEqual(resp['state'], 'pending')
+
+    async def test_pair_status_leaks_no_code_or_token(self):
+        _add_session('tok_secret_value')
+        with patch.object(bm, '_print_pair_code'):
+            await self._call({'action': 'pair_generate'})
+        resp = await self._call({'action': 'pair_status'})
+        body = json.dumps(resp)
+        self.assertNotIn('tok_secret_value', body)
+        self.assertNotIn(bm._pair_code, body)
+        self.assertEqual(set(resp), {'state', 'expires_in'})
+
+    async def test_info_pid_identifies_which_daemon_answered(self):
+        # Two daemons each own their instance's socket, so the pid in the
+        # reply is how a caller tells them apart.
+        with patch.object(bm, '_listen',
+                          {'host': '127.0.0.1', 'port': 7432, 'scheme': 'https'}):
+            resp = await self._call({'action': 'info'})
+        self.assertEqual(resp['pid'], os.getpid())
+
+    async def test_info_reports_listener(self):
+        with patch.object(bm, '_listen',
+                          {'host': '0.0.0.0', 'port': 3389, 'scheme': 'https'}):
+            resp = await self._call({'action': 'info'})
+        self.assertEqual(resp['host'], '0.0.0.0')
+        self.assertEqual(resp['port'], 3389)
+        self.assertEqual(resp['scheme'], 'https')
+        self.assertEqual(resp['pid'], os.getpid())
+
+    async def test_info_leaks_no_session_tokens(self):
+        _add_session('tok_secret_value')
+        with patch.object(bm, '_listen',
+                          {'host': '127.0.0.1', 'port': 7432, 'scheme': 'http'}):
+            resp = await self._call({'action': 'info'})
+        self.assertNotIn('tok_secret_value', json.dumps(resp))
+        self.assertEqual(set(resp), {'pid', 'host', 'port', 'scheme', 'advertise', 'fingerprint', 'unix'})
+
+    async def test_info_before_listen_is_empty_not_an_error(self):
+        with patch.object(bm, '_listen', {}):
+            resp = await self._call({'action': 'info'})
+        self.assertEqual(resp['port'], 0)
+        self.assertNotIn('error', resp)
+
+    async def test_sessions_list_empty(self):
+        resp = await self._call({'action': 'sessions_list'})
+        self.assertIsInstance(resp, list)
+        self.assertEqual(len(resp), 0)
+
+    async def test_sessions_list_populated(self):
+        _add_session('tok_abcdef_123456')
+        resp = await self._call({'action': 'sessions_list'})
+        self.assertIsInstance(resp, list)
+        self.assertEqual(len(resp), 1)
+        entry = resp[0]
+        self.assertIn('ip', entry)
+        self.assertIn('paired_at', entry)
+        self.assertIn('token', entry)
+        self.assertIn('token_full', entry)
+        # abbreviated token ends with …
+        self.assertTrue(entry['token'].endswith('…'))
+
+    async def test_sessions_delete_all(self):
+        _add_session('tok1')
+        _add_session('tok2')
+        with patch.object(bm, '_save_tokens'):
+            resp = await self._call({'action': 'sessions_delete', 'token': None})
+        self.assertTrue(resp.get('ok'))
+        self.assertEqual(resp.get('removed'), 2)
+        self.assertEqual(len(bm._sessions), 0)
+
+    async def test_sessions_delete_specific(self):
+        _add_session('tok_gone')
+        _add_session('tok_kept')
+        with patch.object(bm, '_save_tokens'):
+            resp = await self._call({'action': 'sessions_delete', 'token': 'tok_gone'})
+        self.assertTrue(resp.get('ok'))
+        self.assertNotIn('tok_gone', bm._sessions)
+        self.assertIn('tok_kept', bm._sessions)
+
+    async def test_sessions_delete_not_found(self):
+        resp = await self._call({'action': 'sessions_delete', 'token': 'nosuchtoken'})
+        self.assertIn('error', resp)
+
+    async def test_sessions_delete_empty_token_errors(self):
+        resp = await self._call({'action': 'sessions_delete', 'token': ''})
+        self.assertIn('error', resp)
+
+    async def test_unknown_action_returns_error(self):
+        resp = await self._call({'action': 'do_something_impossible'})
+        self.assertIn('error', resp)
+
+    async def test_bad_json_returns_error(self):
+        resp = await self._call_raw(b'not valid json\n')
+        self.assertIn('error', resp)
+
+    async def test_non_dict_json_returns_error(self):
+        resp = await self._call([1, 2, 3])
+        self.assertIn('error', resp)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket handler
+# ---------------------------------------------------------------------------
+
+class TestWsHandler(AsyncHTTPTestCase):
+    def get_app(self):
+        return bm._make_app()
+
+    def setUp(self):
+        super().setUp()
+        _clear_sessions()
+        bm._pair_code = ''
+
+    def tearDown(self):
+        _clear_sessions()
+        super().tearDown()
+
+    def _ws_req(self, token=None):
+        url = f'ws://localhost:{self.get_http_port()}/ws'
+        if token:
+            headers = HTTPHeaders({'Cookie': f'trustmux_session={token}'})
+            return HTTPRequest(url, headers=headers)
+        return url
+
+    @gen_test(timeout=5)
+    async def test_invalid_token_closes_connection(self):
+        conn = await websocket_connect(self._ws_req(token='badtoken'))
+        msg = await conn.read_message()
+        self.assertIsNone(msg)
+
+    @gen_test(timeout=5)
+    async def test_forwarded_host_from_the_serve_proxy_is_honoured(self):
+        """tailscale serve's Unix-socket target (the `start` default) hands
+        the daemon Host: localhost and carries the real tailnet name in
+        X-Forwarded-Host. check_origin() must compare against that, not the
+        raw Host header, or it rejects every real browser as cross-origin.
+        Only trustworthy with _trust_forwarded_host on, i.e. real --https/
+        serve mode (see _external_host) -- so it's patched on here."""
+        url = f'ws://localhost:{self.get_http_port()}/ws'
+        headers = HTTPHeaders({
+            'Origin': 'https://frink.tailbbeaa.ts.net',
+            'X-Forwarded-Host': 'frink.tailbbeaa.ts.net',
+            'Cookie': 'trustmux_session=badtoken',
+        })
+        with patch.object(bm, '_trust_forwarded_host', True):
+            conn = await websocket_connect(HTTPRequest(url, headers=headers))
+            msg = await conn.read_message()
+        self.assertIsNone(msg)   # got past check_origin; closed for the bad token instead
+
+    @gen_test(timeout=5)
+    async def test_forwarded_host_mismatch_is_still_refused(self):
+        url = f'ws://localhost:{self.get_http_port()}/ws'
+        headers = HTTPHeaders({
+            'Origin': 'https://evil.example',
+            'X-Forwarded-Host': 'frink.tailbbeaa.ts.net',
+        })
+        with patch.object(bm, '_trust_forwarded_host', True):
+            with self.assertRaises(Exception):
+                await websocket_connect(HTTPRequest(url, headers=headers))
+
+    @gen_test(timeout=5)
+    async def test_forwarded_host_ignored_outside_serve_mode(self):
+        """_trust_forwarded_host is off by default (start-local/start-direct:
+        no tailscale serve proxy in front, so nothing but the client itself
+        could have set this header). A handshake that spoofs
+        X-Forwarded-Host to match its own cross-site Origin, hoping to
+        launder past check_origin, must still be refused -- _external_host
+        falls back to the real Host, which the attacker's Origin genuinely
+        does not match."""
+        self.assertFalse(bm._trust_forwarded_host)  # the default outside serve mode
+        url = f'ws://localhost:{self.get_http_port()}/ws'
+        headers = HTTPHeaders({
+            'Origin': 'https://evil.example',
+            'X-Forwarded-Host': 'evil.example',  # attacker-controlled, matches Origin
+        })
+        with self.assertRaises(Exception):
+            await websocket_connect(HTTPRequest(url, headers=headers))
+
+    @gen_test(timeout=5)
+    async def test_valid_token_receives_initial_sessions(self):
+        tok = _add_session('ws_tok_init')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            msg = await conn.read_message()
+        data = json.loads(msg)
+        self.assertEqual(data['type'], 'sessions')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_websocket_negotiates_permessage_deflate(self):
+        # Real browsers always offer permessage-deflate; passing
+        # compression_options={} here makes tornado's test client do the
+        # same, simulating that. Without get_compression_options()
+        # overridden server-side, tornado declines the extension outright
+        # regardless of what the client offers -- this proves the server
+        # actually accepts and uses it, not just that the client asked.
+        tok = _add_session('ws_tok_deflate')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok), compression_options={})
+            await conn.read_message()
+        self.assertIsNotNone(conn.protocol._compressor)
+        self.assertIsNotNone(conn.protocol._decompressor)
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_list_sessions_returns_sessions(self):
+        tok = _add_session('ws_tok_ls')
+        fake = [{'id': '$0', 'name': 'main', 'attached': True, 'windows': []}]
+        with patch.object(bm, 'tmux_list_sessions', return_value=fake):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps({'type': 'list_sessions'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'sessions')
+        self.assertEqual(data['data'], fake)
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_ping_returns_pong(self):
+        tok = _add_session('ws_tok_ping')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps({'type': 'ping'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'pong')
+        self.assertIn('server_ts', data)
+        self.assertIn('server_ip', data)
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_invalid_json_returns_error(self):
+        tok = _add_session('ws_tok_json')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message('not valid json {{{')
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        self.assertIn('invalid JSON', data['message'])
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_oversized_message_returns_error(self):
+        tok = _add_session('ws_tok_size')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message('x' * 20_000)
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        self.assertIn('too large', data['message'])
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_subscribe_invalid_pane_id_returns_error(self):
+        tok = _add_session('ws_tok_sub')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps({'type': 'subscribe', 'pane_id': 'notvalid'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_subscribe_valid_pane_id_streams_snapshot(self):
+        tok = _add_session('ws_tok_sub_ok')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            with patch.object(bm, 'tmux_capture_pane', return_value='hello pane'):
+                await conn.write_message(json.dumps({'type': 'subscribe', 'pane_id': '%1'}))
+                resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'snapshot')
+        self.assertEqual(data['pane_id'], '%1')
+        self.assertEqual(data['data'], 'hello pane')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_stream_pane_sends_delta_for_appended_output(self):
+        # End-to-end: a busy pane whose content grows by one line between
+        # polls should produce a real "delta" message on the wire (not a
+        # full "update"), and that delta must reconstruct the exact new
+        # content -- the actual saving this whole feature exists for.
+        tok = _add_session('ws_tok_delta')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()  # initial sessions push
+
+        captures = ['line1\nline2\nline3', 'line1\nline2\nline3\nline4']
+        def fake_capture(pane_id, history_lines, ansi=False, join=False):
+            return captures[0] if len(captures) == 1 else captures.pop(0)
+
+        with patch.object(bm, 'tmux_capture_pane', side_effect=fake_capture):
+            await conn.write_message(json.dumps({'type': 'subscribe', 'pane_id': '%1', 'lines': 10}))
+            snap = json.loads(await conn.read_message())
+            self.assertEqual(snap['type'], 'snapshot')
+            self.assertEqual(snap['data'], 'line1\nline2\nline3')
+
+            delta = json.loads(await conn.read_message())
+        self.assertEqual(delta['type'], 'delta')
+        self.assertEqual(delta['pane_id'], '%1')
+        self.assertEqual(delta['drop'], 0)
+        # A real JSON array, not a newline-joined string -- a genuinely
+        # blank appended line and "nothing appended" would otherwise both
+        # serialize to "", which the client couldn't tell apart.
+        self.assertEqual(delta['append'], ['line4'])
+
+        # Reconstruction property the client relies on.
+        rebuilt = snap['data'].split('\n')[delta['drop']:] + delta['append']
+        self.assertEqual('\n'.join(rebuilt), 'line1\nline2\nline3\nline4')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_stream_pane_awaits_write_before_next_capture(self):
+        # Regression test for a real bug found on a live connection: _send
+        # used to fire off write_message() without awaiting it, so a
+        # client slower than the daemon's 0.5s poll tick (e.g. a
+        # high-latency phone link) never applied any backpressure -- every
+        # tick's full pane repaint just kept queuing in the kernel socket
+        # buffer behind whatever hadn't drained yet. Measured on a real
+        # connection: this grew to 2.6MB of stale, already-superseded pane
+        # updates, which a fresh pane-switch snapshot then had to wait
+        # behind on the same ordered stream -- explaining reports of
+        # context switches taking tens of seconds despite the daemon
+        # responding instantly. The fix (_send_wait) awaits the write
+        # before the loop captures again, so a stalled client pauses the
+        # loop instead of piling up further sends.
+        tok = _add_session('ws_tok_backpressure')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()  # initial sessions push
+
+        handler = next(iter(bm._ws_clients[tok]))
+
+        capture_calls = []
+        def fake_capture(pane_id, history_lines, ansi=False, join=False):
+            capture_calls.append(time.monotonic())
+            return f'content-{len(capture_calls)}'
+
+        pending_writes = []
+        def fake_write_message(payload):
+            fut = asyncio.get_event_loop().create_future()
+            pending_writes.append(fut)
+            return fut
+
+        with patch.object(bm, 'tmux_capture_pane', side_effect=fake_capture), \
+             patch.object(handler, 'write_message', side_effect=fake_write_message):
+            await conn.write_message(json.dumps({'type': 'subscribe', 'pane_id': '%1', 'lines': 10}))
+            await asyncio.sleep(0.1)
+            self.assertEqual(len(capture_calls), 1)
+
+            # Well past two 0.5s poll ticks -- with the old fire-and-forget
+            # _send this would have captured (and queued sends for) two or
+            # three more times by now.
+            await asyncio.sleep(1.3)
+            self.assertEqual(
+                len(capture_calls), 1,
+                'stream_pane must pause on an undelivered write, not pile up more captures/sends',
+            )
+
+            # Resolving the stuck write lets the loop proceed; the next
+            # 0.5s tick should produce exactly one more capture.
+            pending_writes[0].set_result(None)
+            await asyncio.sleep(0.7)
+            self.assertEqual(len(capture_calls), 2)
+
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_send_keys_invalid_pane_id_returns_error(self):
+        tok = _add_session('ws_tok_sk')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps(
+                {'type': 'send_keys', 'pane_id': 'bad', 'keys': 'ls'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_send_keys_with_req_id_acks_on_success(self):
+        # The PWA correlates this with a pending, optimistically-cleared
+        # input box -- without it, a client on a slow/flaky link has no way
+        # to tell "processed" apart from "still in flight" or "lost".
+        tok = _add_session('ws_tok_sk_ack')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]), \
+             patch.object(bm, 'tmux_send_keys'):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps(
+                {'type': 'send_keys', 'pane_id': '%1', 'keys': 'ls', 'req_id': 'abc123'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'send_keys_ack')
+        self.assertEqual(data['req_id'], 'abc123')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_send_keys_without_req_id_gets_no_ack(self):
+        # Every other send_keys call site (key bar taps, Esc/Ctrl-C) doesn't
+        # pass req_id and must not start getting an extra reply per
+        # keystroke just because the ack mechanism now exists. Proven
+        # directly (nothing arrives within a bounded wait) rather than by
+        # racing against a second request's reply -- two independently
+        # scheduled async tasks have no guaranteed completion order, so
+        # that would only coincidentally catch a regression, not reliably.
+        tok = _add_session('ws_tok_sk_noack')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]), \
+             patch.object(bm, 'tmux_send_keys'):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps(
+                {'type': 'send_keys', 'pane_id': '%1', 'keys': 'ls'}))
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(conn.read_message(), timeout=0.5)
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_send_keys_invalid_pane_id_with_req_id_echoes_it(self):
+        tok = _add_session('ws_tok_sk_err_req')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps(
+                {'type': 'send_keys', 'pane_id': 'bad', 'keys': 'ls', 'req_id': 'xyz'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        self.assertEqual(data['req_id'], 'xyz')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_send_keys_unexpected_failure_with_req_id_echoes_it(self):
+        # The generic except-Exception handler wrapping every message type
+        # must also correlate, not just the pane_id-validation error --an
+        # unexpected failure partway through is exactly when knowing which
+        # pending send it was matters most.
+        tok = _add_session('ws_tok_sk_crash')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]), \
+             patch.object(bm, 'tmux_send_keys', side_effect=RuntimeError('boom')):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps(
+                {'type': 'send_keys', 'pane_id': '%1', 'keys': 'ls', 'req_id': 'crash-1'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        self.assertEqual(data['req_id'], 'crash-1')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_new_session_empty_name_returns_error(self):
+        tok = _add_session('ws_tok_ns')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps({'type': 'new_session', 'name': ''}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_new_window_invalid_session_id_returns_error(self):
+        tok = _add_session('ws_tok_nw')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps(
+                {'type': 'new_window', 'session_id': 'notvalid'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_new_pane_invalid_window_id_returns_error(self):
+        tok = _add_session('ws_tok_np')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps(
+                {'type': 'new_pane', 'window_id': 'notvalid'}))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        conn.close()
+
+    @gen_test(timeout=5)
+    async def test_non_dict_json_returns_error(self):
+        tok = _add_session('ws_tok_nd')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            await conn.write_message(json.dumps([1, 2, 3]))
+            resp = await conn.read_message()
+        data = json.loads(resp)
+        self.assertEqual(data['type'], 'error')
+        conn.close()
+
+    @gen_test(timeout=10)
+    async def test_rate_limit_triggers_error(self):
+        tok = _add_session('ws_tok_rate')
+        with patch.object(bm, 'tmux_list_sessions', return_value=[]):
+            conn = await websocket_connect(self._ws_req(token=tok))
+            await conn.read_message()
+            # Flood with messages exceeding the per-second rate limit
+            burst = bm._WS_RATE_LIMIT + 5
+            for _ in range(burst):
+                await conn.write_message(json.dumps({'type': 'list_sessions'}))
+            rate_errors = []
+            for _ in range(burst):
+                resp = await conn.read_message()
+                if resp is None:
+                    break
+                d = json.loads(resp)
+                if d.get('type') == 'error' and 'rate' in d.get('message', '').lower():
+                    rate_errors.append(d)
+                    break
+        self.assertGreater(len(rate_errors), 0, 'Expected at least one rate-limit error')
+        conn.close()
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

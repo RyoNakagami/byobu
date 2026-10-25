@@ -1,0 +1,625 @@
+.TH TRUSTMUX 1 "2026-06-09" "trustmux" "User Commands"
+.SH NAME
+trustmux \- manage the Trustmux daemon
+.SH SYNOPSIS
+.B trustmux
+.I COMMAND
+.RI [ options ]
+.SH DESCRIPTION
+.B trustmux
+is the single command-line interface for the Trustmux daemon — a lightweight
+server that lets you monitor and interact with your tmux/Byobu sessions from
+a phone browser over your Tailscale network.
+.PP
+All operations are subcommands of
+.BR trustmux :
+initial setup, starting and stopping the daemon, login-hook management, and
+device pairing.
+.SH COMMANDS
+.SS "Daemon lifecycle"
+.TP
+.B setup
+One-time setup: verify Tailscale is installed and connected, then configure
+.B tailscale serve
+for HTTPS on the daemon port (7432 by default; see
+.BR \-\-port ).
+.TP
+.B start
+Start the daemon in HTTPS mode via
+.B tailscale serve
+(default, recommended).
+.TP
+.B start\-local
+Start the daemon bound to 127.0.0.1 only, for access via an SSH port-forward.
+No TLS certificate is generated; the tunnel provides encryption.
+.TP
+.B start\-direct
+Start the daemon with a self-signed TLS certificate, binding on all interfaces
+for LAN/direct access without Tailscale.
+.TP
+.B stop
+Send SIGTERM to the running daemon.
+Tailscale serve configuration is left in place.
+.TP
+.B restart
+Stop then start the daemon in HTTPS mode.
+.TP
+.B status
+Show whether the daemon is running and the URL to connect to.
+.TP
+.B log
+Tail this instance's daemon log (see
+.BR FILES ).
+.TP
+.B list
+List every instance that has a state directory, with the port, scheme and pid
+of any that are running.
+Instances whose daemon is stopped are shown with dashes.
+.TP
+.B rm
+Delete this instance's state directory — session tokens, TLS keypair, log,
+socket and pid file — and remove its login hook so it does not start again at
+the next login.
+.IP
+An instance is created by its first
+.B start
+and persists until removed, so this is the only way to retire one.
+Refused while the instance's daemon is running, and refused for the
+.B default
+instance;
+.B \-\-force
+overrides both, stopping a running daemon first.
+.SS "Login hook"
+.TP
+.B enable
+Run first-time setup if needed, start the daemon, and install a hook in the
+user's shell login file
+.RI ( ~/.profile ,
+.IR ~/.bash_profile ,
+or
+.IR ~/.zprofile )
+so the daemon starts automatically on each login.
+Only available for the
+.B default
+instance, since it starts the daemon in
+.B tailscale serve
+mode; see
+.BR \-\-name .
+.TP
+.B disable
+Stop the running daemon and remove the login hook so the daemon no longer
+starts automatically.
+Only this instance's hook is removed, so disabling one leaves any others in
+place.
+Paired device tokens are preserved.
+.SS "Device pairing"
+.TP
+.B pair
+Ask the running daemon to generate a one-time 6-digit pairing code (valid for
+60 seconds) and display it along with the URL your phone should open.
+If
+.BR qrencode (1)
+is installed, a QR code is printed for one-scan pairing.
+The command then waits for the code to be used and returns as soon as a device
+pairs, or when the code expires, whichever comes first.
+It clears the screen and prints either
+.B "pair accepted from " \fIIP\fR
+(exit status 0) or
+.B "no client paired"
+(exit status 1).
+.TP
+.B unpair
+List all currently paired devices (IP address, browser label, and pairing
+time) and offer an interactive menu to remove one or all of them.
+.SH OPTIONS
+.TP
+.B setup \-\-quiet
+Suppress the "Next steps" output after a successful setup.
+.TP
+.BI \-\-port " PORT"
+TCP port the daemon listens on (default: 7432).
+Accepted by
+.BR setup ,
+.BR start ,
+.BR start\-local ,
+.BR start\-direct ,
+.BR stop ,
+.BR restart ,
+.B status
+and
+.BR enable .
+.IP
+Only the port changes; each mode binds the same address it always has.
+.B stop
+and
+.B status
+do not normally need the flag: they ask the running daemon over the admin
+socket which port it is on, so a daemon started on a non-default port is still
+found without repeating
+.BR \-\-port .
+The same answer gives
+.B pair
+the correct URL and QR code.
+.IP
+.B enable
+records the port in the login hook it writes, so a non-default port survives
+logout; re-running
+.B "enable \-\-port"
+rewrites an existing hook rather than leaving the old port in place.
+.TP
+.BI \-\-advertise " SOURCE"
+Address a phone should use, for when it is not the one this host can see.
+Accepted by
+.BR start ,
+.BR start\-local ,
+.BR start\-direct ,
+.B restart
+and
+.BR enable .
+Repeatable.
+.IP
+Behind NAT — a cloud instance, most often — the daemon only ever sees an
+internal address, so both the URL
+.B pair
+prints and the names in the certificate
+.B start\-direct
+generates describe a host nothing outside can route to.
+.I SOURCE
+overrides that.
+It does
+.I not
+change what the daemon binds; combine it with a firewall rule that admits the
+port.
+.IP
+.I SOURCE
+is one of:
+.RS
+.TP
+.I HOST
+or
+.I HOST:PORT
+A literal address or name.
+The daemon's own scheme and port fill in what is omitted, so
+.B \-\-advertise\ 203.0.113.45
+on a daemon serving HTTPS on 7432 advertises
+.IR https://203.0.113.45:7432/ .
+.TP
+.I URL
+A full
+.I http://
+or
+.I https://
+URL, which overrides both scheme and port — for a reverse proxy terminating
+TLS on 443 in front of the daemon.
+A path, query or fragment is rejected: trustmux serves from the root, and the
+pairing code is carried in the fragment.
+.TP
+.BI cmd: PROGRAM
+Run
+.I PROGRAM
+and take one address per line of its standard output.
+.RE
+.IP
+.B cmd:
+is how an address that changes stays correct.
+A cloud instance with an ephemeral public address gets a different one across a
+stop/start cycle, so a literal written down once would quietly go stale, while
+.B cmd:
+is re-run on every daemon start.
+.IP
+.I PROGRAM
+is split into arguments with shell-style quoting but is
+.I not
+run by a shell: no pipelines, no redirection, no
+.IR $(...) .
+Those characters are rejected rather than passed through to the program, so put
+a pipeline in a script and name the script.
+An absolute path is safest, a daemon's
+.B PATH
+being whatever started it.
+.IP
+Resolution is strict, and any failure stops the daemon rather than falling back
+to the address it would have guessed: a non-zero exit, no output, a blank line,
+a value that is not an address, or more than 5 seconds across all sources.
+This is deliberate.
+A shell wrapper whose
+.B curl
+fails typically prints an empty line and still exits 0, and treating that as
+"nothing to advertise" would hand out an unreachable URL and a certificate for
+the wrong host — neither of which a warning would fix.
+.IP
+Every resolved address is added to the certificate as a subject alternative
+name; the first supplies the URL that
+.BR pair ,
+.B status
+and
+.B start
+print.
+A browser rejects a certificate that omits the name in the URL bar outright,
+rather than offering the click-through a self-signed certificate gets, so
+advertising an address without certifying it would be worse than useless.
+.TP
+.B \-\-no\-advertise
+Advertise nothing, ignoring any source in
+.B TRUSTMUX_ADVERTISE
+or the instance's configuration file.
+Accepted wherever
+.B \-\-advertise
+is.
+.TP
+.BI \-\-name " NAME"
+Act on the named instance instead of
+.BR default .
+Accepted by every subcommand.
+Each instance keeps its own pid file, admin socket, log, session tokens and
+TLS certificate, so several daemons can run at once — on different ports,
+or on the same port at different bind addresses.
+.IP
+.I NAME
+must match
+.RB ` [A-Za-z0-9][A-Za-z0-9._-]{0,31} ':
+it becomes a directory name and is written into the login hook, so separators,
+leading dots and shell metacharacters are rejected rather than sanitised.
+.IP
+Only the
+.B default
+instance can use
+.B tailscale serve
+mode.
+.B serve
+publishes on the tailnet's port 443, which just one daemon can own — a
+second would silently take over the mapping and leave the first running but
+unreachable.
+Named instances therefore use
+.B start\-direct
+or
+.BR start\-local ,
+and
+.BR setup ,
+.BR start ,
+.B restart
+and
+.B enable
+refuse them with a message pointing at those modes.
+Note that
+.B \-\-port
+does not lift this restriction: it moves only the loopback backend that
+.B tailscale serve
+proxies to, not the tailnet-facing port.
+.TP
+.B \-\-force
+Accepted by
+.BR rm .
+Remove the instance even though its daemon is running (it is stopped first),
+or even though it is the
+.B default
+instance.
+.SH ENVIRONMENT
+.TP
+.B TRUSTMUX_PORT
+Default port when
+.B \-\-port
+is not given, for users who always want a different port.
+An out-of-range or non-numeric value is an error, not a silent fallback.
+.TP
+.B TRUSTMUX_INSTANCE
+Default instance when
+.B \-\-name
+is not given.
+An invalid name is an error, not a silent fallback.
+.TP
+.B TRUSTMUX_ADVERTISE
+Default advertise source when
+.B \-\-advertise
+is not given.
+Holds a single source, not a list: no separator would be safe, since
+.RB ` : '
+collides with both URL schemes and the
+.B cmd:
+prefix while
+.RB ` , '
+can appear inside a command's arguments.
+A
+.B cmd:
+source already yields as many addresses as it likes, so nothing is out of reach.
+.TP
+.B TRUSTMUX_CONFIG_DIR
+.TQ
+.B TRUSTMUX_STATE_DIR
+Override the configuration and state base directories individually.
+Each takes precedence over the corresponding XDG variable.
+Pointing both at a scratch directory is the supported way to run a throwaway
+daemon — from a development tree, for instance — without touching the real
+one.
+.B start ,
+.B stop ,
+.B status
+and
+.B list
+act only on a daemon that this instance itself started, determined from its own
+admin socket and pid file rather than from who holds a port, so the isolation
+holds even when the scratch daemon shares a port with the real one.
+.SH FILES
+Files live in the XDG base directories, with one subdirectory per instance:
+.I $XDG_CONFIG_HOME
+(default
+.IR ~/.config )
+holds the one file the user writes by hand, and
+.I $XDG_STATE_HOME
+(default
+.IR ~/.local/state )
+holds everything the daemon owns.
+.PP
+Below,
+.I INSTANCE
+is the
+.B \-\-name
+name, or
+.B default
+when unset.
+.SS Configuration
+.TP
+.I $XDG_CONFIG_HOME/trustmux/machines.json
+Optional: sibling machine list for the in-app machine selector.
+Shared by every instance.
+.TP
+.I $XDG_CONFIG_HOME/trustmux/instances/INSTANCE.json
+Optional per-instance settings, hand-written.
+One key so far:
+.BR advertise ,
+a string or list of strings, each a
+.B \-\-advertise
+source.
+.IP
+.RS
+.nf
+{"advertise": ["cmd:/usr/local/bin/external-ip", "tmux.example.com"]}
+.fi
+.RE
+.IP
+This is the durable home for a source, and the only one a login hook will find:
+.B \-\-advertise
+applies to one daemon and then is gone.
+Sources are re-resolved on every start, which is what makes writing one down
+safe even when the address behind it changes.
+.IP
+Because a source can name a program to run, a file writable by group or other
+is refused rather than read; keep it mode 0600.
+Configuration rather than state because it records intent, not a result.
+.SS State
+.TP
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/tokens.json
+Paired device session tokens (mode 0600).
+.TP
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/cert.pem
+.TQ
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/key.pem
+Self-signed TLS keypair used by
+.BR start\-direct .
+.TP
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/trustmux.log
+Daemon log file, tailed by
+.BR "trustmux log" .
+.TP
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/trustmux.sock
+Admin Unix socket (mode 0600) used by
+.BR pair ,
+.B unpair
+and by
+.B stop
+and
+.B status
+to ask the daemon which port it is on.
+.TP
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/http.sock
+HTTP listener in
+.B start
+mode (mode 0600), which
+.B tailscale serve
+proxies the tailnet name to; removed when the daemon exits.
+.TP
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/trustmux.pid
+PID file written at daemon startup, holding
+.RI \(dq pid " " port \(dq.
+The port is recorded so that a daemon which has stopped replying on its admin
+socket can still be matched against the port
+.B stop
+was asked about.
+.PP
+The socket and pid file are deliberately kept here rather than under
+.IR $XDG_RUNTIME_DIR ,
+where the spec would put them: systemd-logind deletes
+.I /run/user/$UID
+when a user's last login session ends unless
+.B loginctl enable-linger
+is set, which would strand a still-running daemon with no socket to reach it
+by — and trustmux exists precisely to be started and then reached later.
+That directory also does not exist on macOS or in most containers.
+A socket or pid file left behind by a killed daemon is therefore detected
+rather than swept away: the socket refuses connections once its daemon is
+gone, and a recorded pid is only believed when it is confirmed to hold the
+port in question.
+.SS Migration
+Earlier versions kept everything directly in
+.IR ~/.config/trustmux .
+On first run,
+.IR tokens.json ,
+.IR cert.pem ,
+.I key.pem
+and
+.I trustmux.log
+are moved from there into the
+.B default
+instance's state directory, preserving their modes.
+Any stale
+.I trustmux.pid
+and
+.I trustmux.sock
+are deliberately left in place, since a daemon predating the upgrade may still
+be serving on that socket.
+.SH EXAMPLES
+Typical first-time setup:
+.PP
+.RS
+.nf
+trustmux setup
+trustmux enable
+trustmux pair
+.fi
+.RE
+.PP
+Daily use:
+.PP
+.RS
+.nf
+trustmux status
+trustmux restart
+trustmux log
+.fi
+.RE
+.PP
+Run on a different port; later commands find it without the flag:
+.PP
+.RS
+.nf
+trustmux start\-direct \-\-port 3389
+trustmux status
+trustmux pair
+trustmux stop
+.fi
+.RE
+.PP
+A second daemon alongside the first, with its own tokens and log:
+.PP
+.RS
+.nf
+trustmux start\-direct \-\-name work \-\-port 3389
+trustmux pair \-\-name work
+trustmux list
+trustmux stop \-\-name work
+.fi
+.RE
+.PP
+A throwaway daemon that touches none of the above:
+.PP
+.RS
+.nf
+export TRUSTMUX_CONFIG_DIR=$(mktemp \-d)
+export TRUSTMUX_STATE_DIR=$TRUSTMUX_CONFIG_DIR/state
+trustmux start\-local \-\-port 3389
+.fi
+.RE
+.PP
+On a cloud instance whose public address the host itself cannot see.
+Write a program that prints it — here a one-liner against the metadata
+service, which unlike a shell pipeline reports its own failure:
+.PP
+.RS
+.nf
+$ cat /usr/local/bin/external\-ip
+#!/bin/sh
+exec curl \-\-fail \-\-silent \-H Metadata\-Flavor:Google \\
+  http://metadata.google.internal/computeMetadata/v1/instance/\\
+network\-interfaces/0/access\-configs/0/external\-ip
+
+$ trustmux start\-direct \-\-advertise cmd:/usr/local/bin/external\-ip
+$ trustmux pair
+.fi
+.RE
+.PP
+To keep it across reboots, put the source in the instance's configuration file
+(see
+.BR FILES )
+rather than in the command line, and the address is looked up afresh each time:
+.PP
+.RS
+.nf
+mkdir \-p ~/.config/trustmux/instances
+echo '{"advertise": ["cmd:/usr/local/bin/external\-ip"]}' \\
+  > ~/.config/trustmux/instances/default.json
+chmod 600 ~/.config/trustmux/instances/default.json
+trustmux start\-direct
+.fi
+.RE
+.SH SECURITY
+.SS "Pairing code"
+The one-time pairing code is a 6-digit decimal value drawn from
+.BR secrets.randbelow (1,000,000),
+giving 1,000,000 possible values.
+The code is valid for 60 seconds.
+After three incorrect guesses from one address, or nine in total, the code is
+invalidated and a new one must be generated with
+.BR "trustmux pair" .
+Counting per address keeps one peer -- or one web page open in some browser on
+the tailnet -- from spending the real phone's guesses; the total still makes
+brute force infeasible, at under a 0.001% chance of success per pairing window,
+and each new window requires the machine owner to run
+.B trustmux pair
+again.
+An incorrect guess also incurs a 0.5-second artificial delay.
+The pairing endpoint refuses requests a browser labels as coming from another
+site, and accepts only JSON bodies, so a page on another origin cannot submit
+guesses through a visitor's browser.
+.SS "Session tokens"
+After a successful pairing the daemon issues a 256-bit URL-safe session token
+.RB ( secrets.token_urlsafe (32))
+stored in this instance's
+.I tokens.json
+(mode 0600; see
+.BR FILES )
+and delivered to the browser as an
+.BR httponly ,
+.B SameSite=Strict
+cookie.
+Tokens are validated with a constant-time comparison to prevent timing attacks.
+Sessions expire after 90 days of inactivity and can be revoked at any time with
+.BR "trustmux unpair" .
+.SS "Network exposure"
+In the default
+.B start
+mode the daemon binds only to the Tailscale IP (100.x.x.x), so the pairing
+endpoint is unreachable from the public internet or from other local-network
+devices.
+Behind
+.BR "tailscale serve" ,
+the daemon listens on a Unix socket in its state directory
+.RI ( http.sock ,
+mode 0600 inside a 0700 directory) and the serve mapping carries the tailnet
+name to it; no TCP port is bound, so there is nothing another local user could
+bind in its place while the daemon is down.
+When the installed tailscale cannot proxy to a Unix socket, the daemon falls
+back to plain HTTP on 127.0.0.1.
+On that fallback a mapping left in place while the daemon is not listening
+would forward the tailnet -- and the phone's session cookie -- to whichever
+local user binds the loopback port first, so
+.B stop
+removes the mapping it created
+.RB ( "\-\-keep\-serve"
+leaves it), and
+.B status
+warns while a mapping points at nothing.
+In
+.B start\-direct
+mode the daemon binds on all interfaces; the pairing-code and session-token
+protections above remain in force, but the network attack surface is broader.
+.B \-\-advertise
+does not itself widen this — it changes only what is published — but
+advertising a public address is normally paired with a firewall rule admitting
+the port, and that does: the daemon then faces the internet with the pairing
+code and session token as its only protection, rather than a local network.
+Prefer
+.B start
+or
+.B start\-local
+where either will do.
+In
+.B start\-local
+mode the daemon binds to 127.0.0.1 only and is accessible solely through an
+explicit SSH port-forward.
+.SH SEE ALSO
+.BR trustmuxd (1),
+.BR tailscale (1),
+.BR tmux (1),
+.BR byobu (1)
+.SH AUTHOR
+Dustin Kirkland <kirkland@ubuntu.com>

@@ -1,0 +1,104 @@
+# Trustmux — mobile companion daemon for byobu/tmux.
+#
+# The wrappers in $(bindir) import the trustmux Python package from a fixed
+# location (trustmuxpydir), so we install the modules to a flat directory
+# tree rather than into Python's site-packages.  This keeps autotools-based
+# installs decoupled from any system Python's site-packages layout, and
+# matches what downstream distro packaging has historically done.
+#
+# A parallel pip/PyPI distribution is built from this same source via
+# pyproject.toml; the two installation paths are independent.
+
+# Use $(prefix)/lib explicitly rather than $(libdir) so that Debian
+# multiarch builds (libdir=/usr/lib/x86_64-linux-gnu) still land Python
+# modules in the arch-independent /usr/lib/trustmux that the wrappers
+# expect — matching the historical Debian layout.
+trustmuxpydir = $(prefix)/lib/trustmux
+trustmuxmoddir = $(trustmuxpydir)/trustmux
+dist_trustmuxmod_DATA = \
+	trustmux/__init__.py \
+	trustmux/__main__.py \
+	trustmux/_daemon.py \
+	trustmux/_ctl.py \
+	trustmux/_paths.py \
+	trustmux/_advertise.py \
+	trustmux/_pair.py \
+	trustmux/_unpair.py \
+	trustmux/_enable.py \
+	trustmux/_disable.py
+
+trustmuxstaticdir = $(datadir)/trustmux/static
+dist_trustmuxstatic_DATA = \
+	trustmux/static/index.html \
+	trustmux/static/app.js \
+	trustmux/static/sw.js \
+	trustmux/static/trustmux.svg \
+	trustmux/static/trustmux-logo.svg
+
+trustmuxiconsdir = $(datadir)/trustmux/static/icons
+dist_trustmuxicons_DATA = \
+	trustmux/static/icons/icon-192.png \
+	trustmux/static/icons/icon-512.png
+
+# Bundled fallback monospace font (see index.html's @font-face comment for
+# why): guarantees correct box-drawing table alignment on any device, no
+# matter what's locally installed. LICENSE is Bitstream Vera Fonts license
+# text, required alongside the font files by its own terms.
+trustmuxfontsdir = $(datadir)/trustmux/static/fonts
+dist_trustmuxfonts_DATA = \
+	trustmux/static/fonts/DejaVuSansMono.woff2 \
+	trustmux/static/fonts/DejaVuSansMono-Bold.woff2 \
+	trustmux/static/fonts/LICENSE
+
+dist_man1_MANS = \
+	man/man1/trustmux.1 \
+	man/man1/trustmuxd.1
+
+# Generated wrappers — sed-substitute @trustmuxpydir@ at build time so
+# the path resolves to the actual configure --prefix.  Using Make rules
+# rather than AC_CONFIG_FILES because $(libdir) is only fully expanded
+# at Make time, not configure time.
+WRAPPERS = \
+	trustmux \
+	trustmuxd
+
+bin_SCRIPTS = $(WRAPPERS:%=%.gen)
+
+bashcompdir = $(datadir)/bash-completion/completions
+dist_bashcomp_DATA = bash-completion/trustmux
+
+EXTRA_DIST = \
+	trustmux.in \
+	trustmuxd.in \
+	bash-completion/trustmux \
+	pyproject.toml \
+	requirements.txt \
+	uv.lock \
+	README.md \
+	generate_screenshots.py \
+	tests/__init__.py \
+	tests/test_advertise.py \
+	tests/test_ctl.py \
+	tests/test_paths.py \
+	tests/test_daemon.py \
+	tests/test_daemon_extended.py
+
+CLEANFILES = $(WRAPPERS:%=%.gen)
+
+do_subst = sed -e 's|@trustmuxpydir[@]|$(trustmuxpydir)|g'
+
+%.gen: %.in Makefile
+	$(do_subst) < $(srcdir)/$*.in > $@
+	chmod +x $@
+
+# Install with the right names (strip the .gen suffix) and rename
+# trustmux-daemon → trustmux to match Debian's historical layout, where
+# /usr/bin/trustmux is the user-facing entry point for the daemon.
+install-exec-hook:
+	cd $(DESTDIR)$(bindir) && \
+	  for w in $(WRAPPERS); do \
+	    mv $$w.gen $$w; \
+	  done
+
+uninstall-hook:
+	cd $(DESTDIR)$(bindir) && rm -f $(WRAPPERS)
